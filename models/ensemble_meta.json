@@ -1,0 +1,70 @@
+{
+  "base_weights": {
+    "Claim_Frequency": {
+      "prophet": 0.173,
+      "lgbm": 0.354,
+      "naive": 0.473
+    },
+    "Claim_Severity": {
+      "prophet": 0.144,
+      "lgbm": 0.32,
+      "naive": 0.536
+    },
+    "Total_Claim": {
+      "prophet": 0.138,
+      "lgbm": 0.282,
+      "naive": 0.58
+    }
+  },
+  "ensemble_val_mapes": {
+    "Claim_Frequency": 6.762806071142044,
+    "Claim_Severity": 4.888910654888628,
+    "Total_Claim": 2.7197409270872948
+  },
+  "features": {
+    "FEATURES_FREQ": [
+      "Time_Index",
+      "Month_Sin",
+      "Month_Cos",
+      "Quarter_Sin",
+      "Quarter_Cos",
+      "Freq_Lag_1",
+      "Freq_Lag_2",
+      "Freq_Lag_3",
+      "Freq_Rolling_3",
+      "Freq_Rolling_6",
+      "Freq_Std_3",
+      "Total_Lag_1",
+      "Exposure"
+    ],
+    "FEATURES_SEV": [
+      "Time_Index",
+      "Month_Sin",
+      "Month_Cos",
+      "Quarter_Sin",
+      "Quarter_Cos",
+      "Sev_Lag_1",
+      "Sev_Lag_2",
+      "Sev_Lag_3",
+      "Sev_Rolling_3",
+      "Sev_Rolling_6",
+      "Sev_Std_3",
+      "Freq_Lag_1",
+      "Exposure"
+    ],
+    "FEATURES_TOTAL": [
+      "Time_Index",
+      "Month_Sin",
+      "Month_Cos",
+      "Quarter_Sin",
+      "Quarter_Cos",
+      "Total_Lag_1",
+      "Total_Lag_2",
+      "Total_Rolling_3",
+      "Total_Rolling_6",
+      "Freq_Lag_1",
+      "Sev_Lag_1",
+      "Exposure"
+    ]
+  }
+}
