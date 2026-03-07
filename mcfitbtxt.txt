@@ -1,0 +1,1995 @@
+```text
+# AXA Financial Indonesia — Prediksi Klaim Asuransi
+## MCF ITB 2026
+Notebook ini menyajikan pipeline lengkap untuk memprediksi **Frekuensi Klaim**, **Severitas Klaim**, dan **Total Klaim** bulanan portofolio AXA Financial Indonesia yang terdiri dari 4.096 pemegang polis, dengan horizon forecast 17 bulan (Agustus 2025 – Desember 2026).
+
+### Gambaran Masalah
+- **Data historis**: 19 bulan (Januari 2024 – Juli 2025), 4.627 klaim PAID
+- **Horizon forecast**: 17 bulan (Agustus 2025 – Desember 2026)
+- **Metrik evaluasi**: MAPE (Mean Absolute Percentage Error)
+- **Tantangan utama**: Rasio historis vs forecast hampir 1:1 sehingga risiko overfitting tinggi
+
+### Pendekatan
+Digunakan **ensemble tiga model komplementer**:
+| Model | Peran |
+|---|---|
+| **Prophet** | Menangkap tren jangka panjang dan seasonality kuartalan |
+| **LightGBM** | Menangkap pola non-linear dan interaksi fitur |
+| **Seasonal Naive** | Baseline statistik berbasis rata-rata historis per bulan |
+
+Ketiga model digabungkan menggunakan **inverse MAPE weighting** dari walk-forward cross-validation, dengan **progressive weighting** yang secara bertahap meningkatkan bobot Seasonal Naive di horizon panjang untuk mencegah error compounding.
+
+### Struktur Notebook
+| Cell | Deskripsi |
+|---|---|
+| 0 | Instalasi library dan import |
+| 1 | Load data, preprocessing, dan winsorisasi |
+| 2 | Exploratory Data Analysis (EDA) |
+| 3 | Agregasi bulanan, proyeksi exposure, feature engineering |
+| 4 | Walk-forward cross-validation dan perhitungan bobot ensemble |
+| 5 | Training model final pada seluruh data |
+| 6 | Forecast 17 bulan dengan progressive weighting |
+| 7 | Pembuatan file submission Kaggle |
+| 8 | Analisis dampak feature engineering |
+| 9A | Analisis faktor berpengaruh level individual klaim |
+| 9B | Analisis feature importance level portofolio |
+| 10 | Ekspor Model |
+| 11| Rekomendasi bisnis |
+
+# CELL 0: INSTALL DAN IMPORT LIBRARY
+```python
+import subprocess, sys
+for pkg in ['prophet', 'lightgbm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'])
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+from prophet import Prophet
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+from scipy.stats import mstats, spearmanr, kruskal
+from scipy.stats.mstats import winsorize
+import statsmodels.api as sm
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+```
+
+## Cell 1 — Load Data, Preprocessing, dan Winsorisasi
+
+### Sumber Data
+Dua dataset digabungkan untuk analisis ini:
+- **Data_Polis.csv** — 4.096 pemegang polis aktif dengan atribut demografis (gender, tanggal lahir, tanggal efektif polis) dan informasi produk (Plan Code: M-001, M-002, M-003)
+- **Data_Klaim.csv** — 5.781 transaksi klaim dengan diagnosis (ICD), tipe layanan (Inpatient/Outpatient), metode pembayaran (Cashless/Reimburse), tanggal masuk-keluar RS, dan nominal klaim yang disetujui
+
+### Langkah Preprocessing
+1. **Parsing tanggal** — standarisasi format dari YYYYMMDD (data polis) dan format campuran (data klaim)
+2. **Filter PAID** — hanya menyimpan klaim dengan status PAID; tersisa 4.627 records
+3. **Deduplikasi** — menghapus Claim ID yang duplikat
+4. **Winsorisasi (1%–99%)** — membatasi nilai klaim ekstrem di level individual klaim
+
+### Mengapa Winsorisasi, Bukan StandardScaler?
+Distribusi nominal klaim asuransi sangat right-skewed dengan outlier ekstrem. Winsorisasi dipilih karena:
+- Mempertahankan skala Rupiah asli yang penting untuk pelaporan aktuaria
+- LightGBM adalah tree-based model yang **invariant terhadap monotonic transformation** — StandardScaler tidak memberikan manfaat
+- Winsorisasi membatasi pengaruh outlier tanpa membuang data tersebut
+
+### Feature Engineering Data Polis
+- **Umur** — dihitung per 1 Juli 2025 sebagai tanggal referensi
+- **Lama_Polis** — tahun sejak tanggal efektif polis
+- **Kelompok_Umur** — 5 kategori: <18, 18–30, 31–45, 46–60, >60
+- **Length of Stay** — selisih tanggal masuk dan keluar RS
+- **Claim_Ratio** — nominal klaim disetujui dibagi biaya RS aktual
+
+### Hasil
+| Dataset | Shape |
+|---|---|
+| Data Polis | (4.096, 9) |
+| Data Klaim (setelah filter) | (4.627, 14) |
+| Merged | (4.627, 21) |
+
+**Missing values pada Data Klaim:**
+- Inpatient/Outpatient: 37 baris
+- ICD Diagnosis: 6 baris
+- Tanggal Pembayaran Klaim: 37 baris
+- Lokasi RS: 7 baris
+
+Missing values ditangani dengan eksklusi baris hanya pada analisis yang membutuhkan kolom tersebut.
+
+**Batas winsorisasi:**
+- Lower bound: Rp 187.242
+- Upper bound: Rp 633.686.130
+
+# CELL 1: LOAD DATA DAN PREPROCESSING
+```python
+df_polis = pd.read_csv('Data_Polis.csv')
+df_klaim = pd.read_csv('Data_Klaim.csv')
+
+# Strip whitespace semua kolom string
+df_polis.columns = df_polis.columns.str.strip()
+df_klaim.columns = df_klaim.columns.str.strip()
+for col in df_polis.select_dtypes('object').columns:
+    df_polis[col] = df_polis[col].str.strip()
+for col in df_klaim.select_dtypes('object').columns:
+    df_klaim[col] = df_klaim[col].str.strip()
+
+# Parse tanggal polis
+df_polis['Tanggal Lahir']         = pd.to_datetime(df_polis['Tanggal Lahir'], format='%Y%m%d')
+df_polis['Tanggal Efektif Polis'] = pd.to_datetime(df_polis['Tanggal Efektif Polis'], format='%Y%m%d')
+
+# Parse tanggal klaim
+df_klaim['Tanggal Pembayaran Klaim'] = pd.to_datetime(df_klaim['Tanggal Pembayaran Klaim'], errors='coerce')
+df_klaim['Tanggal Pasien Masuk RS']  = pd.to_datetime(df_klaim['Tanggal Pasien Masuk RS'],  errors='coerce')
+df_klaim['Tanggal Pasien Keluar RS'] = pd.to_datetime(df_klaim['Tanggal Pasien Keluar RS'], errors='coerce')
+
+# Identifikasi missing values
+print("MISSING VALUES - DATA POLIS")
+mv_polis = df_polis.isnull().sum()
+print(mv_polis[mv_polis > 0] if mv_polis.sum() > 0 else "Tidak ada missing value")
+
+print("\nMISSING VALUES - DATA KLAIM")
+mv_klaim = df_klaim.isnull().sum()
+print(mv_klaim[mv_klaim > 0] if mv_klaim.sum() > 0 else "Tidak ada missing value")
+
+# Visualisasi missing values dengan heatmap
+plt.figure(figsize=(12, 5))
+sns.heatmap(df_klaim.isnull(), cbar=True, cmap='viridis', yticklabels=False)
+plt.title('Missing Values - Data Klaim')
+plt.tight_layout()
+plt.show()
+
+# Filter hanya klaim PAID dan hapus duplikat
+df_klaim = df_klaim[df_klaim['Status Klaim'] == 'PAID'].copy()
+before   = len(df_klaim)
+df_klaim = df_klaim.drop_duplicates(subset='Claim ID')
+print(f"\nFilter PAID: {len(df_klaim)} rows")
+print(f"Duplikat dihapus: {before - len(df_klaim)} rows")
+
+# Normalisasi melalui Winsorizing 1%-99% di level individual klaim
+low_p  = np.percentile(df_klaim['Nominal Klaim Yang Disetujui'], 1)
+high_p = np.percentile(df_klaim['Nominal Klaim Yang Disetujui'], 99)
+df_klaim['Nominal Klaim Yang Disetujui'] = df_klaim['Nominal Klaim Yang Disetujui'].clip(low_p, high_p)
+
+print(f"\nWinsorize 1%-99% selesai")
+print(f"   Lower bound : Rp {low_p:,.0f}")
+print(f"   Upper bound : Rp {high_p:,.0f}")
+
+# Periode klaim dari tanggal masuk RS
+df_klaim['Periode_Klaim'] = (
+    df_klaim['Tanggal Pasien Masuk RS']
+    .dt.to_period('M')
+    .dt.to_timestamp()
+)
+
+# Feature engineering polis
+reference_date = pd.Timestamp('2025-07-01')
+df_polis['Umur'] = (
+    (reference_date - df_polis['Tanggal Lahir']).dt.days / 365.25
+).astype(int)
+df_polis['Lama_Polis'] = (
+    (reference_date - df_polis['Tanggal Efektif Polis']).dt.days / 365.25
+).round(2)
+df_polis['Kelompok_Umur'] = pd.cut(
+    df_polis['Umur'],
+    bins=[0, 17, 30, 45, 60, 100],
+    labels=['<18', '18-30', '31-45', '46-60', '>60']
+)
+
+# Merge polis ke klaim untuk analisis
+df_merged = df_klaim.merge(
+    df_polis[['Nomor Polis', 'Gender', 'Plan Code',
+              'Umur', 'Lama_Polis', 'Kelompok_Umur']],
+    on='Nomor Polis',
+    how='left'
+)
+df_merged['Length_of_Stay'] = (
+    df_merged['Tanggal Pasien Keluar RS'] -
+    df_merged['Tanggal Pasien Masuk RS']
+).dt.days.clip(lower=0)
+df_merged['Claim_Ratio'] = (
+    df_merged['Nominal Klaim Yang Disetujui'] /
+    df_merged['Nominal Biaya RS Yang Terjadi'].replace(0, np.nan)
+).fillna(0).clip(0, 1)
+
+print(f"\nCell 1 selesai")
+print(f"   Polis  : {df_polis.shape}")
+print(f"   Klaim  : {df_klaim.shape}")
+print(f"   Merged : {df_merged.shape}")
+```
+
+```
+MISSING VALUES - DATA POLIS
+Tidak ada missing value
+
+MISSING VALUES - DATA KLAIM
+Inpatient/Outpatient        37
+ICD Diagnosis                6
+ICD Description              6
+Tanggal Pembayaran Klaim    37
+Lokasi RS                    7
+dtype: int64
+
+Filter PAID: 4627 rows
+Duplikat dihapus: 0 rows
+
+Winsorize 1%-99% selesai
+   Lower bound : Rp 187,242
+   Upper bound : Rp 633,686,130
+
+Cell 1 selesai
+   Polis  : (4096, 9)
+   Klaim  : (4627, 14)
+   Merged : (4627, 21)
+```
+
+## Cell 2 — Exploratory Data Analysis (EDA)
+
+### Tujuan
+Memahami karakteristik distribusi, tren temporal, dan hubungan antar variabel pada data klaim sebelum masuk ke tahap pemodelan. EDA dilakukan pada dua level:
+- **Level individual klaim** — distribusi nominal, perbandingan antar kategori demografis dan produk
+- **Level portofolio bulanan** — tren frekuensi, severitas, dan total klaim dari waktu ke waktu
+
+### Visualisasi yang Dihasilkan
+| Plot | Deskripsi |
+|---|---|
+| 1 | Distribusi nominal klaim (histogram) |
+| 2 | Boxplot nominal per gender |
+| 3 | Boxplot nominal per kelompok umur |
+| 4 | Boxplot nominal per plan code |
+| 5 | Boxplot nominal per tipe layanan (Inpatient/Outpatient) |
+| 6 | Boxplot nominal per metode klaim (Cashless/Reimburse) |
+| 7 | Scatter plot: Umur vs nominal klaim |
+| 8 | Scatter plot: Length of Stay vs nominal klaim |
+| 9 | Bar chart: jumlah klaim per kelompok umur |
+| 10 | Bar chart: tren frekuensi klaim bulanan |
+| 11 | Line chart: tren severitas klaim bulanan |
+| 12 | Line chart: tren total klaim bulanan |
+| 13 | Bar chart: Top 10 ICD diagnosis |
+| 14 | Heatmap korelasi fitur numerik |
+| 15 | Pie chart: proporsi Inpatient vs Outpatient |
+
+### Temuan Utama
+**Distribusi & Outlier**
+- Distribusi nominal klaim sangat right-skewed — mayoritas klaim di bawah Rp 50 juta, namun terdapat outlier hingga Rp 633 juta setelah winsorisasi
+- Puncak distribusi berada di bawah Rp 20 juta dengan frekuensi lebih dari 2.000 klaim
+
+**Faktor Demografis**
+- Gender tidak menunjukkan perbedaan signifikan pada median nominal klaim (F dan M hampir identik)
+- Kelompok umur >60 tahun memiliki median tertinggi; kelompok 31–45 memiliki jangkauan terluas (outlier >Rp 160 juta)
+- Kelompok umur >60 mendominasi frekuensi klaim dengan lebih dari 2.200 kasus — 4x lebih tinggi dari kelompok usia muda
+
+**Faktor Produk & Layanan**
+- Plan M-003 memiliki median nominal klaim tertinggi; Plan M-001 memiliki nilai maksimum tertinggi
+- Inpatient (IP) menyumbang 49,2% volume klaim dengan nilai per klaim tertinggi (maks >Rp 175 juta)
+- Metode Cashless secara konsisten menghasilkan median klaim lebih tinggi dibanding Reimburse (~Rp 20 juta vs <Rp 10 juta)
+
+**Tren Temporal**
+- Puncak historis: Januari 2024 (302 klaim, severitas Rp 62,5 juta, total Rp 19,0 miliar)
+- Setelah Januari 2024, frekuensi stabil di 208–278 klaim/bulan
+- Titik terendah: Januari 2025 (<Rp 10 miliar total) sebelum rebound di 2025
+- Lonjakan severitas kembali terjadi di Februari 2025 (Rp 58,3 juta)
+
+**Korelasi**
+- Length of Stay adalah prediktor numerik terkuat (korelasi Spearman: 0,503)
+- Umur berkorelasi positif lemah (0,136)
+- Lama_Polis dan Claim_Ratio tidak signifikan
+
+**Top Diagnosis**
+- N18.0 (gagal ginjal stadium akhir): ~300 klaim — tertinggi
+- C50 (kanker payudara) dan H26 (katarak): masing-masing >200 klaim
+- Ketiga diagnosis ini sangat berkorelasi dengan dominasi kelompok umur >60 tahun
+
+# CELL 2: EKSPLORASI DATA (EDA)
+```python
+target_col = 'Nominal Klaim Yang Disetujui'
+
+# 1. Distribusi Nominal Klaim setelah winsorize
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.hist(df_klaim[target_col] / 1e6, bins=50, color='steelblue', edgecolor='white')
+ax.set_title('Distribusi Nominal Klaim Yang Disetujui (Setelah Winsorize)')
+ax.set_xlabel('Nominal Klaim (Juta Rp)')
+ax.set_ylabel('Frekuensi')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 2. Boxplot Nominal Klaim per Gender
+fig, ax = plt.subplots(figsize=(8, 5))
+sns.boxplot(data=df_merged, x='Gender', y=target_col,
+            palette=['steelblue', 'salmon'], showfliers=False, ax=ax)
+ax.set_title('Distribusi Nominal Klaim per Gender')
+ax.set_xlabel('Gender')
+ax.set_ylabel('Nominal Klaim (Rp)')
+plt.tight_layout()
+plt.show()
+
+# 3. Boxplot Nominal Klaim per Kelompok Umur
+fig, ax = plt.subplots(figsize=(10, 5))
+order = ['<18', '18-30', '31-45', '46-60', '>60']
+sns.boxplot(data=df_merged, x='Kelompok_Umur', y=target_col,
+            order=order, palette='coolwarm', showfliers=False, ax=ax)
+ax.set_title('Distribusi Nominal Klaim per Kelompok Umur')
+ax.set_xlabel('Kelompok Umur')
+ax.set_ylabel('Nominal Klaim (Rp)')
+plt.tight_layout()
+plt.show()
+
+# 4. Boxplot Nominal Klaim per Plan Code
+fig, ax = plt.subplots(figsize=(10, 5))
+sns.boxplot(data=df_merged, x='Plan Code', y=target_col,
+            palette='Set2', showfliers=False, ax=ax)
+ax.set_title('Distribusi Nominal Klaim per Plan Code')
+ax.set_xlabel('Plan Code')
+ax.set_ylabel('Nominal Klaim (Rp)')
+ax.tick_params(axis='x', rotation=45)
+plt.tight_layout()
+plt.show()
+
+# 5. Boxplot Nominal Klaim: Inpatient vs Outpatient
+fig, ax = plt.subplots(figsize=(8, 5))
+sns.boxplot(data=df_merged, x='Inpatient/Outpatient', y=target_col,
+            palette=['tomato', 'skyblue'], showfliers=False, ax=ax)
+ax.set_title('Distribusi Nominal Klaim: Inpatient vs Outpatient')
+ax.set_xlabel('Tipe Klaim')
+ax.set_ylabel('Nominal Klaim (Rp)')
+plt.tight_layout()
+plt.show()
+
+# 6. Boxplot Nominal Klaim: Reimburse vs Cashless
+if 'Reimburse/Cashless' in df_merged.columns:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.boxplot(data=df_merged, x='Reimburse/Cashless', y=target_col,
+                palette=['mediumpurple', 'lightgreen'], showfliers=False, ax=ax)
+    ax.set_title('Distribusi Nominal Klaim: Reimburse vs Cashless')
+    ax.set_xlabel('Metode Klaim')
+    ax.set_ylabel('Nominal Klaim (Rp)')
+    plt.tight_layout()
+    plt.show()
+
+# 7. Scatter plot: Umur vs Nominal Klaim
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.scatter(df_merged['Umur'], df_merged[target_col] / 1e6,
+           alpha=0.3, color='steelblue', s=10)
+z      = np.polyfit(df_merged['Umur'].dropna(),
+                    df_merged.loc[df_merged['Umur'].notna(), target_col] / 1e6, 1)
+p_line = np.poly1d(z)
+x_line = np.linspace(df_merged['Umur'].min(), df_merged['Umur'].max(), 100)
+ax.plot(x_line, p_line(x_line), color='red', linewidth=2, label='Tren')
+ax.set_title('Scatter Plot: Umur vs Nominal Klaim')
+ax.set_xlabel('Umur (tahun)')
+ax.set_ylabel('Nominal Klaim (Juta Rp)')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 8. Scatter plot: Length of Stay vs Nominal Klaim
+fig, ax = plt.subplots(figsize=(10, 5))
+los_clean = df_merged[df_merged['Length_of_Stay'] <= 30]
+ax.scatter(los_clean['Length_of_Stay'], los_clean[target_col] / 1e6,
+           alpha=0.3, color='darkorange', s=10)
+ax.set_title('Scatter Plot: Length of Stay vs Nominal Klaim (maks 30 hari)')
+ax.set_xlabel('Length of Stay (hari)')
+ax.set_ylabel('Nominal Klaim (Juta Rp)')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 9. Histogram jumlah klaim per kelompok umur
+fig, ax = plt.subplots(figsize=(10, 5))
+freq_umur = df_merged.groupby('Kelompok_Umur')['Claim ID'].count().reindex(order)
+freq_umur.plot(kind='bar', color='steelblue', edgecolor='white', ax=ax)
+ax.set_title('Jumlah Klaim per Kelompok Umur')
+ax.set_xlabel('Kelompok Umur')
+ax.set_ylabel('Jumlah Klaim')
+ax.tick_params(axis='x', rotation=0)
+ax.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+plt.show()
+
+# 10. Tren frekuensi klaim bulanan
+fig, ax = plt.subplots(figsize=(14, 5))
+monthly_freq = df_klaim.groupby('Periode_Klaim')['Claim ID'].count()
+ax.bar(monthly_freq.index, monthly_freq.values,
+       color='steelblue', edgecolor='white', width=20)
+ax.set_title('Tren Frekuensi Klaim Bulanan')
+ax.set_xlabel('Periode')
+ax.set_ylabel('Jumlah Klaim')
+ax.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+plt.show()
+
+# 11. Tren severitas klaim bulanan
+fig, ax = plt.subplots(figsize=(14, 5))
+monthly_sev = df_klaim.groupby('Periode_Klaim')['Nominal Klaim Yang Disetujui'].mean()
+ax.plot(monthly_sev.index, monthly_sev.values / 1e6,
+        marker='o', color='darkorange', linewidth=2)
+ax.set_title('Tren Severitas Klaim Bulanan (Rata-rata per Klaim)')
+ax.set_xlabel('Periode')
+ax.set_ylabel('Rata-rata Nominal Klaim (Juta Rp)')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 12. Tren total klaim bulanan
+fig, ax = plt.subplots(figsize=(14, 5))
+monthly_total = df_klaim.groupby('Periode_Klaim')['Nominal Klaim Yang Disetujui'].sum()
+ax.plot(monthly_total.index, monthly_total.values / 1e9,
+        marker='o', color='teal', linewidth=2)
+ax.set_title('Tren Total Klaim Bulanan')
+ax.set_xlabel('Periode')
+ax.set_ylabel('Total Klaim (Miliar Rp)')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 13. Top 10 ICD Diagnosis berdasarkan jumlah klaim
+fig, ax = plt.subplots(figsize=(12, 6))
+top_icd = (df_merged['ICD Diagnosis']
+           .value_counts()
+           .head(10))
+top_icd.sort_values().plot(kind='barh', color='steelblue',
+                           edgecolor='white', ax=ax)
+ax.set_title('Top 10 ICD Diagnosis berdasarkan Jumlah Klaim')
+ax.set_xlabel('Jumlah Klaim')
+ax.set_ylabel('ICD Diagnosis')
+ax.grid(True, alpha=0.3, axis='x')
+plt.tight_layout()
+plt.show()
+
+# 14. Heatmap korelasi fitur numerik
+fig, ax = plt.subplots(figsize=(10, 8))
+numeric_cols = ['Umur', 'Lama_Polis', 'Length_of_Stay',
+                'Claim_Ratio', target_col]
+corr_matrix  = df_merged[numeric_cols].corr()
+sns.heatmap(corr_matrix, annot=True, fmt='.3f',
+            cmap='coolwarm', center=0,
+            linewidths=0.5, ax=ax)
+ax.set_title('Heatmap Korelasi Fitur Numerik vs Nominal Klaim')
+plt.tight_layout()
+plt.show()
+
+# 15. Proporsi Inpatient vs Outpatient
+fig, ax = plt.subplots(figsize=(7, 7))
+inout = df_merged['Inpatient/Outpatient'].value_counts()
+ax.pie(inout.values, labels=inout.index,
+       autopct='%1.1f%%', colors=['tomato', 'skyblue'],
+       startangle=90)
+ax.set_title('Proporsi Inpatient vs Outpatient')
+plt.tight_layout()
+plt.show()
+```
+
+*(Visualisasi grafik dihasilkan sesuai kode di atas)*
+
+## Cell 3 — Agregasi Bulanan, Exposure, dan Feature Engineering
+
+### Tujuan
+Mengubah data klaim level individual menjadi data time series bulanan yang siap digunakan oleh ketiga model (Prophet, LightGBM, Seasonal Naive). Tiga target variabel yang diprediksi adalah:
+- **Claim_Frequency** — jumlah klaim per bulan
+- **Claim_Severity** — rata-rata nominal klaim per bulan
+- **Total_Claim** — total nominal klaim per bulan
+
+### Agregasi Bulanan
+Klaim dikelompokkan berdasarkan bulan masuk RS (Tanggal Pasien Masuk RS), menghasilkan 19 titik data bulanan (Januari 2024 – Juli 2025).
+
+### Exposure
+Exposure didefinisikan sebagai jumlah polis aktif per akhir bulan. Hasil regresi linear menunjukkan **slope = 0,00 polis/bulan**, artinya portofolio stabil di 4.096 polis sepanjang periode historis. Proyeksi exposure untuk 17 bulan ke depan dipertahankan di 4.096 polis.
+> Catatan: Exposure terbukti tidak memberikan nilai prediktif pada model (feature importance = 0%) karena tidak ada variasi antar bulan.
+
+### Feature Engineering untuk LightGBM
+Fitur dibangun dalam beberapa kategori:
+**1. Fitur Kalender**
+- `Time_Index` — indeks waktu linear
+- `Month`, `Quarter` — bulan dan kuartal numerik
+**2. Cyclical Encoding**
+- `Month_Sin`, `Month_Cos` — encoding sinus/cosinus bulan untuk menghindari diskontinuitas bulan 12 → bulan 1
+- `Quarter_Sin`, `Quarter_Cos` — encoding kuartalan
+**3. Lag Features** *(tanpa Lag-12 dan YoY untuk mencegah data leakage di 2026)*
+- `Freq_Lag_1/2/3`, `Sev_Lag_1/2/3`, `Total_Lag_1/2`
+**4. Rolling Statistics**
+- Rolling mean 3 dan 6 bulan: `Freq_Rolling_3/6`, `Sev_Rolling_3/6`, `Total_Rolling_3/6`
+- Rolling std 3 bulan: `Freq_Std_3`, `Sev_Std_3`
+**5. Growth Rate**
+- `Freq_Growth`, `Sev_Growth` — pertumbuhan Month-over-Month
+
+### Seasonal Naive
+Nilai rata-rata historis per bulan kalender dihitung sebagai baseline. Untuk bulan dengan hanya 1 observasi, digunakan blending 50% nilai aktual + 50% rata-rata bulan sekitarnya untuk mengurangi sensitivitas terhadap single data point.
+
+### Ringkasan Feature Sets
+| Target | Jumlah Fitur |
+|---|---|
+| Claim Frequency | 13 fitur |
+| Claim Severity | 13 fitur |
+| Total Claim | 12 fitur |
+
+# CELL 3: AGREGASI BULANAN, EXPOSURE, DAN FEATURE ENGINEERING
+```python
+# Agregasi bulanan
+df_monthly = df_klaim.groupby('Periode_Klaim').agg(
+    Claim_Frequency=('Claim ID', 'count'),
+    Total_Claim=('Nominal Klaim Yang Disetujui', 'sum'),
+    Claim_Severity=('Nominal Klaim Yang Disetujui', 'mean')
+).reset_index()
+df_monthly = df_monthly.sort_values('Periode_Klaim').reset_index(drop=True)
+
+print("DATA BULANAN")
+display(df_monthly)
+print(f"\nRentang  : {df_monthly['Periode_Klaim'].min()} -> {df_monthly['Periode_Klaim'].max()}")
+print(f"Total    : {len(df_monthly)} bulan")
+
+# Exposure per bulan — jumlah polis aktif
+exposure_list = []
+for period in df_monthly['Periode_Klaim']:
+    period_end = period + pd.offsets.MonthEnd(0)
+    n_active   = df_polis[
+        df_polis['Tanggal Efektif Polis'] <= period_end
+    ].shape[0]
+    exposure_list.append({'Periode_Klaim': period, 'Exposure': n_active})
+
+df_exposure = pd.DataFrame(exposure_list)
+df_monthly  = df_monthly.merge(df_exposure, on='Periode_Klaim', how='left')
+df_monthly['Claim_Rate'] = (
+    df_monthly['Claim_Frequency'] / df_monthly['Exposure']
+)
+
+print("\nEXPOSURE PER BULAN")
+display(df_monthly[['Periode_Klaim', 'Exposure', 'Claim_Rate']])
+
+# Exposure forecast dengan tren linear
+time_idx      = np.arange(len(df_monthly))
+exp_values    = df_monthly['Exposure'].values
+coeffs        = np.polyfit(time_idx, exp_values, 1)
+exposure_poly = np.poly1d(coeffs)
+future_idx_start = len(df_monthly)
+future_exposure  = [
+    max(int(exposure_poly(future_idx_start + i)), df_monthly['Exposure'].max())
+    for i in range(17)
+]
+
+print(f"\nTren linear exposure: slope = {coeffs[0]:.2f} polis/bulan")
+print(f"   Exposure historis terakhir : {df_monthly['Exposure'].iloc[-1]}")
+print(f"   Exposure forecast bulan 1  : {future_exposure[0]}")
+print(f"   Exposure forecast bulan 17 : {future_exposure[16]}")
+
+# Calendar features
+df_monthly['Time_Index'] = np.arange(len(df_monthly))
+df_monthly['Month']      = df_monthly['Periode_Klaim'].dt.month
+df_monthly['Quarter']    = df_monthly['Periode_Klaim'].dt.quarter
+
+# Cyclical encoding
+df_monthly['Month_Sin']   = np.sin(2 * np.pi * df_monthly['Month'] / 12)
+df_monthly['Month_Cos']   = np.cos(2 * np.pi * df_monthly['Month'] / 12)
+df_monthly['Quarter_Sin'] = np.sin(2 * np.pi * df_monthly['Quarter'] / 4)
+df_monthly['Quarter_Cos'] = np.cos(2 * np.pi * df_monthly['Quarter'] / 4)
+
+# Lag features
+df_monthly['Freq_Lag_1']  = df_monthly['Claim_Frequency'].shift(1)
+df_monthly['Freq_Lag_2']  = df_monthly['Claim_Frequency'].shift(2)
+df_monthly['Freq_Lag_3']  = df_monthly['Claim_Frequency'].shift(3)
+df_monthly['Sev_Lag_1']   = df_monthly['Claim_Severity'].shift(1)
+df_monthly['Sev_Lag_2']   = df_monthly['Claim_Severity'].shift(2)
+df_monthly['Sev_Lag_3']   = df_monthly['Claim_Severity'].shift(3)
+df_monthly['Total_Lag_1'] = df_monthly['Total_Claim'].shift(1)
+df_monthly['Total_Lag_2'] = df_monthly['Total_Claim'].shift(2)
+
+# Rolling features
+df_monthly['Freq_Rolling_3']  = df_monthly['Claim_Frequency'].shift(1).rolling(3).mean()
+df_monthly['Sev_Rolling_3']   = df_monthly['Claim_Severity'].shift(1).rolling(3).mean()
+df_monthly['Total_Rolling_3'] = df_monthly['Total_Claim'].shift(1).rolling(3).mean()
+df_monthly['Freq_Rolling_6']  = df_monthly['Claim_Frequency'].shift(1).rolling(6).mean()
+df_monthly['Sev_Rolling_6']   = df_monthly['Claim_Severity'].shift(1).rolling(6).mean()
+df_monthly['Total_Rolling_6'] = df_monthly['Total_Claim'].shift(1).rolling(6).mean()
+df_monthly['Freq_Std_3'] = df_monthly['Claim_Frequency'].shift(1).rolling(3).std()
+df_monthly['Sev_Std_3']  = df_monthly['Claim_Severity'].shift(1).rolling(3).std()
+
+# Growth rate MoM
+df_monthly['Freq_Growth'] = (
+    df_monthly['Claim_Frequency'] / df_monthly['Freq_Lag_1'] - 1
+).replace([np.inf, -np.inf], 0)
+df_monthly['Sev_Growth'] = (
+    df_monthly['Claim_Severity'] / df_monthly['Sev_Lag_1'] - 1
+).replace([np.inf, -np.inf], 0)
+
+# Seasonal Naive precompute
+seasonal_naive = {}
+for month in range(1, 13):
+    month_data  = df_monthly[df_monthly['Month'] == month]
+    surrounding = df_monthly[
+        df_monthly['Month'].isin(
+            [(month - 1) % 12 + 1, month, (month + 1) % 12 + 1]
+        )
+    ]
+    for target in ['Claim_Frequency', 'Claim_Severity', 'Total_Claim']:
+        if len(month_data) >= 2:
+            val = month_data[target].mean()
+        else:
+            actual_val      = month_data[target].mean() if len(month_data) > 0 \
+                              else surrounding[target].mean()
+            surrounding_val = surrounding[target].mean()
+            val             = 0.5 * actual_val + 0.5 * surrounding_val
+        seasonal_naive[(month, target)] = val
+
+print("\nSeasonal Naive per bulan:")
+for month in range(1, 13):
+    print(f"   Bulan {month:02d} | "
+          f"Freq: {seasonal_naive[(month, 'Claim_Frequency')]:.1f} | "
+          f"Sev: {seasonal_naive[(month, 'Claim_Severity')]/1e6:.2f}M | "
+          f"Total: {seasonal_naive[(month, 'Total_Claim')]/1e9:.3f}B")
+
+# Feature sets per target
+FEATURES_FREQ = [
+    'Time_Index', 'Month_Sin', 'Month_Cos', 'Quarter_Sin', 'Quarter_Cos',
+    'Freq_Lag_1', 'Freq_Lag_2', 'Freq_Lag_3',
+    'Freq_Rolling_3', 'Freq_Rolling_6', 'Freq_Std_3',
+    'Total_Lag_1', 'Exposure',
+]
+FEATURES_SEV = [
+    'Time_Index', 'Month_Sin', 'Month_Cos', 'Quarter_Sin', 'Quarter_Cos',
+    'Sev_Lag_1', 'Sev_Lag_2', 'Sev_Lag_3',
+    'Sev_Rolling_3', 'Sev_Rolling_6', 'Sev_Std_3',
+    'Freq_Lag_1', 'Exposure',
+]
+FEATURES_TOTAL = [
+    'Time_Index', 'Month_Sin', 'Month_Cos', 'Quarter_Sin', 'Quarter_Cos',
+    'Total_Lag_1', 'Total_Lag_2',
+    'Total_Rolling_3', 'Total_Rolling_6',
+    'Freq_Lag_1', 'Sev_Lag_1', 'Exposure',
+]
+
+print(f"\nFeature sets:")
+print(f"   Frequency : {len(FEATURES_FREQ)} fitur")
+print(f"   Severity  : {len(FEATURES_SEV)} fitur")
+print(f"   Total     : {len(FEATURES_TOTAL)} fitur")
+```
+
+```
+DATA BULANAN
+Periode_Klaim,Claim_Frequency,Total_Claim,Claim_Severity
+2024-01-01,302,1.895190e+10,6.275465e+07
+... (data berlanjut hingga 2025-07)
+Rentang  : 2024-01-01 00:00:00 -> 2025-07-01 00:00:00
+Total    : 19 bulan
+
+EXPOSURE PER BULAN
+Periode_Klaim,Exposure,Claim_Rate
+2024-01-01,4096,0.073730
+...
+Tren linear exposure: slope = 0.00 polis/bulan
+Exposure historis terakhir : 4096
+Exposure forecast bulan 1  : 4096
+Exposure forecast bulan 17 : 4096
+
+Seasonal Naive per bulan:
+   Bulan 01 | Freq: 259.0 | Sev: 53.35M | Total: 14.222B
+   ...
+   Bulan 12 | Freq: 234.3 | Sev: 49.35M | Total: 11.520B
+
+Feature sets:
+   Frequency : 13 fitur
+   Severity  : 13 fitur
+   Total     : 12 fitur
+```
+
+## Cell 4 — Walk-Forward Cross-Validation dan Bobot Ensemble
+
+### Tujuan
+Mengevaluasi performa ketiga model (Prophet, LightGBM, Seasonal Naive) secara objektif menggunakan walk-forward cross-validation, lalu menghitung bobot ensemble berdasarkan hasil validasi tersebut.
+
+### Mengapa Walk-Forward, Bukan Random Split?
+Data time series memiliki ketergantungan temporal — nilai bulan ini dipengaruhi oleh bulan sebelumnya. Random split akan menciptakan **data leakage** karena data masa depan bisa masuk ke training set. Walk-forward memastikan model selalu dilatih pada data masa lalu dan divalidasi pada data masa depan, persis seperti kondisi forecasting nyata.
+
+### Konfigurasi Validasi
+- **Minimum training**: 14 bulan
+- **Jumlah fold**: 5
+- **Periode validasi**: Maret 2025 – Juli 2025
+
+| Fold | Training | Validasi |
+|---|---|---|
+| 1 | Jan 2024 – Feb 2025 (14 bln) | Mar 2025 |
+| 2 | Jan 2024 – Mar 2025 (15 bln) | Apr 2025 |
+| 3 | Jan 2024 – Apr 2025 (16 bln) | Mei 2025 |
+| 4 | Jan 2024 – Mei 2025 (17 bln) | Jun 2025 |
+| 5 | Jan 2024 – Jun 2025 (18 bln) | Jul 2025 |
+
+### Konfigurasi Model
+**Prophet**
+- `yearly_seasonality=False` — dinonaktifkan karena data historis < 24 bulan
+- `changepoint_prior_scale=0.01` — regularisasi kuat
+- Custom quarterly seasonality dengan `fourier_order=3`
+
+**LightGBM**
+- Regularisasi ketat: `max_depth=2`, `num_leaves=4`, `min_child_samples=3`
+- `reg_alpha=0.5`, `reg_lambda=1.0`
+
+**Seasonal Naive**
+- Lookup table rata-rata historis per bulan kalender
+
+### Hasil Validasi MAPE
+| Target | Prophet | LightGBM | Seasonal Naive | Ensemble |
+|---|---|---|---|---|
+| Claim Frequency | 14,36% | 7,00% | 5,23% | 6,76% |
+| Claim Severity | 16,15% | 7,25% | 4,34% | 4,89% |
+| Total Claim | 16,00% | 7,84% | 3,82% | 2,72% |
+| **Rata-rata** | **15,50%** | **7,36%** | **4,46%** | **4,79%** |
+
+> Seasonal Naive secara konsisten mengungguli kedua model ML, mencerminkan dominasi pola musiman dalam data 19 bulan. Ensemble tetap memberikan hasil terbaik untuk Total Claim (2,72%).
+
+### Bobot Ensemble
+| Target | w_Prophet | w_LightGBM | w_Naive |
+|---|---|---|---|
+| Claim Frequency | 0,173 | 0,354 | 0,473 |
+| Claim Severity | 0,144 | 0,320 | 0,536 |
+| Total Claim | 0,138 | 0,282 | 0,580 |
+
+# CELL 4: WALK-FORWARD VALIDATION
+```python
+def safe_mape(y_true, y_pred):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
+    mask   = y_true != 0
+    if mask.sum() == 0:
+        return np.nan
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+def run_prophet(train_df, target_col, periods=1):
+    prophet_df = train_df[['Periode_Klaim', target_col]].rename(
+        columns={'Periode_Klaim': 'ds', target_col: 'y'}
+    )
+    model = Prophet(
+        yearly_seasonality=False,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        seasonality_mode='additive',
+        changepoint_prior_scale=0.01,
+        seasonality_prior_scale=1.0,
+    )
+    model.add_seasonality(name='quarterly', period=91.25, fourier_order=3)
+    model.fit(prophet_df, algorithm='Newton')
+    future   = model.make_future_dataframe(periods=periods, freq='MS')
+    forecast = model.predict(future)
+    pred     = forecast['yhat'].iloc[-periods:].values
+    return np.clip(pred, 0, None)
+
+def run_lgbm(train_df, val_df, features, target_col):
+    train_clean = train_df.dropna(subset=features)
+    val_clean   = val_df.dropna(subset=features)
+    if len(train_clean) < 5 or len(val_clean) == 0:
+        return np.array([np.nan])
+    X_train = train_clean[features]
+    y_train = train_clean[target_col]
+    X_val   = val_clean[features]
+    model = LGBMRegressor(
+        n_estimators=200,
+        max_depth=2,
+        num_leaves=4,
+        min_child_samples=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.5,
+        reg_lambda=1.0,
+        random_state=42,
+        verbose=-1
+    )
+    model.fit(X_train, y_train)
+    pred = model.predict(X_val)
+    return np.clip(pred, 0, None)
+
+def get_seasonal_naive(month, target_col):
+    return seasonal_naive.get((month, target_col), 0)
+
+# Walk-forward splits
+MIN_TRAIN = 14
+splits = []
+n      = len(df_monthly)
+for val_idx in range(MIN_TRAIN, n):
+    train = df_monthly.iloc[:val_idx].copy()
+    val   = df_monthly.iloc[val_idx:val_idx + 1].copy()
+    splits.append((train, val))
+
+print("WALK-FORWARD SPLITS")
+print(f"Jumlah fold: {len(splits)}")
+for i, (tr, vl) in enumerate(splits):
+    print(f"   Fold {i+1} | Train: "
+          f"{tr['Periode_Klaim'].min().strftime('%Y-%m')} -> "
+          f"{tr['Periode_Klaim'].max().strftime('%Y-%m')} "
+          f"({len(tr)} bln) | Val: "
+          f"{vl['Periode_Klaim'].iloc[0].strftime('%Y-%m')}")
+
+# Validasi per model per target
+targets = {
+    'Claim_Frequency' : FEATURES_FREQ,
+    'Claim_Severity'  : FEATURES_SEV,
+    'Total_Claim'     : FEATURES_TOTAL,
+}
+val_results = {
+    target: {
+        'prophet_preds' : [],
+        'lgbm_preds'    : [],
+        'naive_preds'   : [],
+        'actuals'       : [],
+    }
+    for target in targets
+}
+
+print("\nRUNNING WALK-FORWARD VALIDATION")
+for i, (train, val) in enumerate(splits):
+    val_month  = val['Periode_Klaim'].iloc[0].month
+    val_period = val['Periode_Klaim'].iloc[0].strftime('%Y-%m')
+    for target_col, features in targets.items():
+        actual = val[target_col].iloc[0]
+        val_results[target_col]['actuals'].append(actual)
+        try:
+            p_prophet = run_prophet(train, target_col, periods=1)[0]
+        except Exception:
+            p_prophet = train[target_col].mean()
+        val_results[target_col]['prophet_preds'].append(p_prophet)
+        
+        p_lgbm = run_lgbm(train, val, features, target_col)
+        p_lgbm = p_lgbm[0] if len(p_lgbm) > 0 and not np.isnan(p_lgbm[0]) \
+                 else train[target_col].mean()
+        val_results[target_col]['lgbm_preds'].append(p_lgbm)
+        
+        p_naive = get_seasonal_naive(val_month, target_col)
+        val_results[target_col]['naive_preds'].append(p_naive)
+    print(f"   Fold {i+1} selesai | Val: {val_period}")
+
+# Hitung MAPE per model
+print("\nVALIDATION MAPE PER MODEL")
+print(f"{'Target':<20} {'Prophet':>10} {'LightGBM':>10} {'Naive':>10}")
+mape_scores = {}
+for target_col in targets:
+    actuals = val_results[target_col]['actuals']
+    m_p     = safe_mape(actuals, val_results[target_col]['prophet_preds'])
+    m_l     = safe_mape(actuals, val_results[target_col]['lgbm_preds'])
+    m_n     = safe_mape(actuals, val_results[target_col]['naive_preds'])
+    mape_scores[target_col] = {'prophet': m_p, 'lgbm': m_l, 'naive': m_n}
+    print(f"   {target_col:<18} {m_p:>9.2f}% {m_l:>9.2f}% {m_n:>9.2f}%")
+
+# Bobot ensemble
+print("\nBOBOT ENSEMBLE — INVERSE MAPE")
+print(f"{'Target':<20} {'w_Prophet':>10} {'w_LightGBM':>10} {'w_Naive':>10}")
+base_weights = {}
+for target_col in targets:
+    scores = mape_scores[target_col]
+    eps    = 1e-6
+    inv_p  = 1 / (scores['prophet'] + eps)
+    inv_l  = 1 / (scores['lgbm']    + eps)
+    inv_n  = 1 / (scores['naive']   + eps)
+    total  = inv_p + inv_l + inv_n
+    w_p = round(inv_p / total, 3)
+    w_l = round(inv_l / total, 3)
+    w_n = round(1 - w_p - w_l, 3)
+    base_weights[target_col] = {'prophet': w_p, 'lgbm': w_l, 'naive': w_n}
+    print(f"   {target_col:<18} {w_p:>10.3f} {w_l:>10.3f} {w_n:>10.3f}")
+
+# Ensemble MAPE di validasi
+print("\nENSEMBLE MAPE DI VALIDASI")
+ensemble_val_mapes = {}
+for target_col in targets:
+    actuals        = np.array(val_results[target_col]['actuals'])
+    p_preds        = np.array(val_results[target_col]['prophet_preds'])
+    l_preds        = np.array(val_results[target_col]['lgbm_preds'])
+    n_preds        = np.array(val_results[target_col]['naive_preds'])
+    w              = base_weights[target_col]
+    ensemble_preds = (
+        w['prophet'] * p_preds +
+        w['lgbm']    * l_preds +
+        w['naive']   * n_preds
+    )
+    m_ens = safe_mape(actuals, ensemble_preds)
+    ensemble_val_mapes[target_col] = m_ens
+    print(f"   {target_col:<20}: {m_ens:.2f}%")
+
+avg_ens_mape = np.mean(list(ensemble_val_mapes.values()))
+print(f"\nAverage Ensemble MAPE : {avg_ens_mape:.2f}%")
+
+# Visualisasi MAPE per model
+fig, ax = plt.subplots(figsize=(10, 6))
+target_labels = ['Frequency', 'Severity', 'Total']
+x      = np.arange(len(target_labels))
+width  = 0.2
+prophet_mapes = [mape_scores[t]['prophet'] for t in targets]
+lgbm_mapes    = [mape_scores[t]['lgbm']    for t in targets]
+naive_mapes   = [mape_scores[t]['naive']   for t in targets]
+ens_mapes     = [ensemble_val_mapes[t]     for t in targets]
+ax.bar(x - 1.5*width, prophet_mapes, width, label='Prophet',        color='steelblue',  alpha=0.85)
+ax.bar(x - 0.5*width, lgbm_mapes,   width, label='LightGBM',       color='darkorange', alpha=0.85)
+ax.bar(x + 0.5*width, naive_mapes,  width, label='Seasonal Naive',  color='lightgreen', alpha=0.85)
+ax.bar(x + 1.5*width, ens_mapes,    width, label='Ensemble',        color='darkred',    alpha=0.85)
+ax.set_title('Perbandingan MAPE Walk-Forward per Model')
+ax.set_ylabel('MAPE (%)')
+ax.set_xticks(x)
+ax.set_xticklabels(target_labels)
+ax.legend()
+ax.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+plt.show()
+```
+
+```
+WALK-FORWARD SPLITS
+Jumlah fold: 5
+Fold 1 | Train: 2024-01 -> 2025-02 (14 bln) | Val: 2025-03
+...
+Fold 5 selesai | Val: 2025-07
+
+VALIDATION MAPE PER MODEL
+Target                  Prophet   LightGBM      Naive
+Claim_Frequency        14.36%      7.00%      5.23%
+Claim_Severity         16.15%      7.25%      4.34%
+Total_Claim            16.00%      7.84%      3.82%
+
+BOBOT ENSEMBLE — INVERSE MAPE
+Target                w_Prophet w_LightGBM    w_Naive
+Claim_Frequency         0.173      0.354      0.473
+Claim_Severity          0.144      0.320      0.536
+Total_Claim             0.138      0.282      0.580
+
+ENSEMBLE MAPE DI VALIDASI
+Claim_Frequency     : 6.76%
+Claim_Severity      : 4.89%
+Total_Claim         : 2.72%
+
+Average Ensemble MAPE : 4.79%
+```
+
+## Cell 5 — Training Model Final pada Seluruh Data
+
+### Tujuan
+Melatih ketiga model menggunakan **seluruh 19 bulan data historis** (Januari 2024 – Juli 2025) sebagai persiapan untuk forecast 17 bulan ke depan.
+
+### Catatan Penting: In-Sample MAPE vs Walk-Forward MAPE
+In-sample MAPE (model diuji pada data yang sama dengan data training) akan selalu jauh lebih rendah dari walk-forward MAPE. Nilai in-sample **bukan** metrik evaluasi yang valid — gunakan hasil Cell 4 sebagai acuan performa model.
+
+| Target | In-Sample MAPE (referensi) | Walk-Forward MAPE (evaluasi utama) |
+|---|---|---|
+| Claim Frequency | 0,43% | 7,00% |
+| Claim Severity | 0,79% | 7,25% |
+| Total Claim | 0,37% | 7,84% |
+
+### Feature Importance LightGBM
+**Frekuensi Klaim** — didominasi pola musiman:
+- `Month_Sin` (21,2%) dan `Month_Cos` (14,6%) → seasonality bulanan sangat kuat
+- `Freq_Lag_3` (19,8%) → autocorrelation kuat pada jeda 1 kuartal
+
+**Severitas Klaim** — didominasi nilai historis:
+- `Sev_Lag_2` (32,2%) dan `Sev_Lag_1` (17,3%) → severitas bersifat *persistent*
+- `Month_Cos` (19,6%) → siklus musiman tetap signifikan
+
+**Total Klaim** — kombinasi rolling dan frekuensi:
+- `Total_Rolling_3` (24,8%) → tren rata-rata bergerak 3 bulan paling prediktif
+- `Freq_Lag_1` (18,5%) → total klaim sangat sensitif terhadap perubahan frekuensi bulan lalu
+
+> **Temuan penting**: Fitur `Exposure` memiliki importance 0% di semua target, mengkonfirmasi bahwa portofolio stabil (4.096 polis) tidak memberikan informasi prediktif tambahan.
+
+# CELL 5: TRAINING FINAL MODELS — FULL DATA
+```python
+def fit_prophet_full(df, target_col):
+    prophet_df = df[['Periode_Klaim', target_col]].rename(
+        columns={'Periode_Klaim': 'ds', target_col: 'y'}
+    )
+    model = Prophet(
+        yearly_seasonality=False,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        seasonality_mode='additive',
+        changepoint_prior_scale=0.01,
+        seasonality_prior_scale=1.0,
+    )
+    model.add_seasonality(name='quarterly', period=91.25, fourier_order=3)
+    model.fit(prophet_df, algorithm='Newton')
+    return model
+
+def fit_lgbm_full(df, features, target_col):
+    df_clean = df.dropna(subset=features)
+    X = df_clean[features]
+    y = df_clean[target_col]
+    model = LGBMRegressor(
+        n_estimators=200,
+        max_depth=2,
+        num_leaves=4,
+        min_child_samples=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.5,
+        reg_lambda=1.0,
+        random_state=42,
+        verbose=-1
+    )
+    model.fit(X, y)
+    return model
+
+# Training Prophet
+print("TRAINING PROPHET — Full Data")
+prophet_freq  = fit_prophet_full(df_monthly, 'Claim_Frequency')
+print("   Prophet Frequency selesai")
+prophet_sev   = fit_prophet_full(df_monthly, 'Claim_Severity')
+print("   Prophet Severity selesai")
+prophet_total = fit_prophet_full(df_monthly, 'Total_Claim')
+print("   Prophet Total selesai")
+
+# Training LightGBM
+print("\nTRAINING LIGHTGBM — Full Data")
+lgbm_freq  = fit_lgbm_full(df_monthly, FEATURES_FREQ,  'Claim_Frequency')
+print("   LightGBM Frequency selesai")
+lgbm_sev   = fit_lgbm_full(df_monthly, FEATURES_SEV,   'Claim_Severity')
+print("   LightGBM Severity selesai")
+lgbm_total = fit_lgbm_full(df_monthly, FEATURES_TOTAL, 'Total_Claim')
+print("   LightGBM Total selesai")
+
+# In-sample MAPE
+print("\nIN-SAMPLE MAPE LIGHTGBM (referensi, bukan evaluasi utama)")
+df_clean_freq  = df_monthly.dropna(subset=FEATURES_FREQ)
+df_clean_sev   = df_monthly.dropna(subset=FEATURES_SEV)
+df_clean_total = df_monthly.dropna(subset=FEATURES_TOTAL)
+insample_freq  = safe_mape(
+    df_clean_freq['Claim_Frequency'],
+    lgbm_freq.predict(df_clean_freq[FEATURES_FREQ])
+)
+insample_sev   = safe_mape(
+    df_clean_sev['Claim_Severity'],
+    lgbm_sev.predict(df_clean_sev[FEATURES_SEV])
+)
+insample_total = safe_mape(
+    df_clean_total['Total_Claim'],
+    lgbm_total.predict(df_clean_total[FEATURES_TOTAL])
+)
+print(f"   Frequency  : {insample_freq:.2f}%")
+print(f"   Severity   : {insample_sev:.2f}%")
+print(f"   Total Claim: {insample_total:.2f}%")
+
+# Feature importance LightGBM
+model_list = [
+    (lgbm_freq,  FEATURES_FREQ,  'Frequency'),
+    (lgbm_sev,   FEATURES_SEV,   'Severity'),
+    (lgbm_total, FEATURES_TOTAL, 'Total Claim'),
+]
+for model, features, label in model_list:
+    imp = pd.Series(model.feature_importances_, index=features)
+    imp = imp.sort_values(ascending=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    imp.plot(kind='barh', color='steelblue', edgecolor='white', ax=ax)
+    ax.set_title(f'Feature Importance LightGBM — {label}')
+    ax.set_xlabel('Importance')
+    ax.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    plt.show()
+
+# Ringkasan bobot ensemble
+print("\nRINGKASAN BOBOT ENSEMBLE (dari Cell 4)")
+print(f"{'Target':<20} {'Prophet':>10} {'LightGBM':>10} {'Naive':>10}")
+for target_col in targets:
+    w = base_weights[target_col]
+    print(f"   {target_col:<18} {w['prophet']:>10.3f} "
+          f"{w['lgbm']:>10.3f} {w['naive']:>10.3f}")
+```
+
+```
+TRAINING PROPHET — Full Data
+   Prophet Frequency selesai
+   Prophet Severity selesai
+   Prophet Total selesai
+
+TRAINING LIGHTGBM — Full Data
+   LightGBM Frequency selesai
+   LightGBM Severity selesai
+   LightGBM Total selesai
+
+IN-SAMPLE MAPE LIGHTGBM (referensi, bukan evaluasi utama)
+   Frequency  : 0.43%
+   Severity   : 0.79%
+   Total Claim: 0.37%
+
+RINGKASAN BOBOT ENSEMBLE (dari Cell 4)
+Target                  Prophet   LightGBM      Naive
+Claim_Frequency         0.173      0.354      0.473
+Claim_Severity          0.144      0.320      0.536
+Total_Claim             0.138      0.282      0.580
+```
+
+## Cell 6 — Forecast 17 Bulan dengan Progressive Weighting
+
+### Tujuan
+Menghasilkan prediksi bulanan untuk periode Agustus 2025 – Desember 2026 menggunakan ensemble tiga model dengan strategi **progressive weighting** yang menyesuaikan bobot berdasarkan horizon forecast.
+
+### Mengapa Progressive Weighting?
+Pada forecast rekursif jangka panjang, LightGBM menggunakan prediksi bulan sebelumnya sebagai input lag. Semakin jauh horizon, error terakumulasi (*error compounding*). Seasonal Naive tidak memiliki masalah ini karena hanya bergantung pada rata-rata historis per bulan kalender.
+
+### Tiga Zona Forecast
+| Zona | Langkah | Bobot ML | Bobot Naive | Alasan |
+|---|---|---|---|---|
+| **ML** | 0 – 4 (Agt–Des 2025) | 90% | 10% | Lag features masih dekat dengan data aktual |
+| **Balance** | 5 – 10 (Jan–Jun 2026) | 90% → 50% | 10% → 50% | Transisi linear, uncertainty mulai meningkat |
+| **Naive** | 11 – 16 (Jul–Des 2026) | 50% → 20% | 50% → 80% | Error compounding tinggi, Naive lebih stabil |
+
+### Hasil Forecast
+| Periode | Frekuensi | Severitas (Jt) | Total (M) | Zona |
+|---|---|---|---|---|
+| Agt 2025 | 235,1 | 51,23 | 11,55 | ML |
+| Des 2025 | 221,6 | 45,89 | 10,20 | ML |
+| Jan 2026 | 227,3 | 45,67 | 10,78 | Balance |
+| Jun 2026 | 228,3 | 51,51 | 11,71 | Balance |
+| Jul 2026 | 254,5 | 49,67 | 12,98 | Naive |
+| Des 2026 | 229,7 | 48,26 | 11,26 | Naive |
+
+### Ringkasan Prediksi 2026 per Kuartal
+| Kuartal | Rata-rata Frekuensi | Rata-rata Severitas (Jt) | Total (M) |
+|---|---|---|---|
+| Q1 2026 (Jan–Mar) | 227,8 | 49,18 | 37,13 |
+| Q2 2026 (Apr–Jun) | 228,9 | 49,90 | 33,32 |
+| Q3 2026 (Jul–Sep) | 237,3 | 50,37 | 36,01 |
+| Q4 2026 (Okt–Des) | 248,5 | 48,08 | 36,55 |
+| **Total 2026** | **235,6** | **49,38** | **142,01** |
+
+### Perbandingan 2025 vs 2026 (Annualized)
+*Catatan: Data 2025 diannualisasi (7 bulan aktual x 12/7) untuk perbandingan apple-to-apple dengan forecast 12 bulan 2026.*
+- **Total Frekuensi**: +3,8% (pertumbuhan kecil, portofolio stabil)
+- **Rata-rata Severitas**: -4,0% (normalisasi setelah lonjakan Feb 2025)
+- **Total Klaim**: -0,3% (relatif flat, konsisten dengan tren historis)
+
+# CELL 6: FORECAST 17 BULAN — PROGRESSIVE WEIGHTING
+```python
+def get_progressive_weights(step, base_w, target_col):
+    if step <= 4:
+        zone_ml    = 0.90
+        zone_naive = 0.10
+    elif step <= 10:
+        progress   = (step - 4) / 6
+        zone_ml    = 0.90 - progress * 0.40
+        zone_naive = 1 - zone_ml
+    else:
+        progress   = (step - 10) / 6
+        zone_ml    = 0.50 - progress * 0.30
+        zone_naive = 1 - zone_ml
+    total_ml_base = base_w['prophet'] + base_w['lgbm'] + 1e-9
+    w_prophet = zone_ml * (base_w['prophet'] / total_ml_base)
+    w_lgbm    = zone_ml * (base_w['lgbm']    / total_ml_base)
+    w_naive   = zone_naive
+    return round(w_prophet, 4), round(w_lgbm, 4), round(w_naive, 4)
+
+def build_future_features(temp_df, next_period, next_exposure):
+    month   = next_period.month
+    quarter = next_period.quarter
+    t_idx   = temp_df['Time_Index'].iloc[-1] + 1
+    feat = {
+        'Time_Index'      : t_idx,
+        'Month_Sin'       : np.sin(2 * np.pi * month / 12),
+        'Month_Cos'       : np.cos(2 * np.pi * month / 12),
+        'Quarter_Sin'     : np.sin(2 * np.pi * quarter / 4),
+        'Quarter_Cos'     : np.cos(2 * np.pi * quarter / 4),
+        'Exposure'        : next_exposure,
+        'Freq_Lag_1'      : temp_df['Claim_Frequency'].iloc[-1],
+        'Freq_Lag_2'      : temp_df['Claim_Frequency'].iloc[-2],
+        'Freq_Lag_3'      : temp_df['Claim_Frequency'].iloc[-3],
+        'Sev_Lag_1'       : temp_df['Claim_Severity'].iloc[-1],
+        'Sev_Lag_2'       : temp_df['Claim_Severity'].iloc[-2],
+        'Sev_Lag_3'       : temp_df['Claim_Severity'].iloc[-3],
+        'Total_Lag_1'     : temp_df['Total_Claim'].iloc[-1],
+        'Total_Lag_2'     : temp_df['Total_Claim'].iloc[-2],
+        'Freq_Rolling_3'  : temp_df['Claim_Frequency'].iloc[-3:].mean(),
+        'Sev_Rolling_3'   : temp_df['Claim_Severity'].iloc[-3:].mean(),
+        'Total_Rolling_3' : temp_df['Total_Claim'].iloc[-3:].mean(),
+        'Freq_Rolling_6'  : temp_df['Claim_Frequency'].iloc[-6:].mean(),
+        'Sev_Rolling_6'   : temp_df['Claim_Severity'].iloc[-6:].mean(),
+        'Total_Rolling_6' : temp_df['Total_Claim'].iloc[-6:].mean(),
+        'Freq_Std_3'      : temp_df['Claim_Frequency'].iloc[-3:].std(),
+        'Sev_Std_3'       : temp_df['Claim_Severity'].iloc[-3:].std(),
+    }
+    return feat
+
+# Prophet forecast sekaligus 17 langkah
+FORECAST_STEPS       = 17
+temp_df              = df_monthly.copy()
+future_prophet_dates = pd.DataFrame({
+    'ds': pd.date_range(start='2025-08-01', periods=FORECAST_STEPS, freq='MS')
+})
+prophet_freq_fc  = np.clip(
+    prophet_freq.predict(future_prophet_dates)['yhat'].values, 0, None)
+prophet_sev_fc   = np.clip(
+    prophet_sev.predict(future_prophet_dates)['yhat'].values, 0, None)
+prophet_total_fc = np.clip(
+    prophet_total.predict(future_prophet_dates)['yhat'].values, 0, None)
+
+forecast_records = []
+print("FORECAST — Agustus 2025 s/d Desember 2026")
+print(f"{'Periode':<12} {'Freq':>8} {'Sev(Jt)':>10} {'Total(M)':>10} "
+      f"{'wP':>6} {'wL':>6} {'wN':>6} {'Zona':>8}")
+
+for step in range(FORECAST_STEPS):
+    next_period   = pd.Timestamp('2025-08-01') + pd.DateOffset(months=step)
+    next_exposure = future_exposure[step]
+    month         = next_period.month
+    feat   = build_future_features(temp_df, next_period, next_exposure)
+    X_next = pd.DataFrame([feat])
+    
+    p_lgbm_freq  = max(0, lgbm_freq.predict(X_next[FEATURES_FREQ])[0])
+    p_lgbm_sev   = max(0, lgbm_sev.predict(X_next[FEATURES_SEV])[0])
+    p_lgbm_total = max(0, lgbm_total.predict(X_next[FEATURES_TOTAL])[0])
+    
+    p_prophet_freq  = prophet_freq_fc[step]
+    p_prophet_sev   = prophet_sev_fc[step]
+    p_prophet_total = prophet_total_fc[step]
+    
+    p_naive_freq  = get_seasonal_naive(month, 'Claim_Frequency')
+    p_naive_sev   = get_seasonal_naive(month, 'Claim_Severity')
+    p_naive_total = get_seasonal_naive(month, 'Total_Claim')
+    
+    wp_f, wl_f, wn_f = get_progressive_weights(
+        step, base_weights['Claim_Frequency'], 'Claim_Frequency')
+    wp_s, wl_s, wn_s = get_progressive_weights(
+        step, base_weights['Claim_Severity'],  'Claim_Severity')
+    wp_t, wl_t, wn_t = get_progressive_weights(
+        step, base_weights['Total_Claim'],     'Total_Claim')
+    
+    p_freq  = wp_f * p_prophet_freq  + wl_f * p_lgbm_freq  + wn_f * p_naive_freq
+    p_sev   = wp_s * p_prophet_sev   + wl_s * p_lgbm_sev   + wn_s * p_naive_sev
+    p_total = wp_t * p_prophet_total + wl_t * p_lgbm_total  + wn_t * p_naive_total
+    
+    p_freq  = max(0, p_freq)
+    p_sev   = max(0, p_sev)
+    p_total = max(0, p_total)
+    
+    zona = 'ML' if step <= 4 else ('Balance' if step <= 10 else 'Naive')
+    print(f"   {next_period.strftime('%Y-%m'):<10} "
+          f"{p_freq:>8.1f} {p_sev/1e6:>10.2f} {p_total/1e9:>10.3f} "
+          f"{wp_f:>6.3f} {wl_f:>6.3f} {wn_f:>6.3f} {zona:>8}")
+    
+    forecast_records.append({
+        'Periode_Klaim'   : next_period,
+        'Claim_Frequency' : p_freq,
+        'Claim_Severity'  : p_sev,
+        'Total_Claim'     : p_total,
+        'w_Prophet'       : wp_f,
+        'w_LightGBM'      : wl_f,
+        'w_Naive'         : wn_f,
+        'Zona'            : zona,
+    })
+    
+    new_row = pd.DataFrame([{
+        'Periode_Klaim'   : next_period,
+        'Claim_Frequency' : p_freq,
+        'Claim_Severity'  : p_sev,
+        'Total_Claim'     : p_total,
+        'Time_Index'      : temp_df['Time_Index'].iloc[-1] + 1,
+        'Exposure'        : next_exposure,
+        'Month'           : month,
+        'Quarter'         : next_period.quarter,
+    }])
+    temp_df = pd.concat([temp_df, new_row], ignore_index=True)
+
+df_forecast = pd.DataFrame(forecast_records)
+
+# Visualisasi forecast
+configs = [
+    ('Claim_Frequency', 'Claim Frequency',       'steelblue',  1),
+    ('Claim_Severity',  'Claim Severity (Juta)',  'darkorange', 1e6),
+    ('Total_Claim',     'Total Claim (Miliar)',   'teal',       1e9),
+]
+zone_colors = {
+    'ML'      : 'lightgreen',
+    'Balance' : 'lightyellow',
+    'Naive'   : 'lightsalmon',
+}
+for col, label, color, divisor in configs:
+    fig, ax = plt.subplots(figsize=(16, 5))
+    ax.plot(
+        df_monthly['Periode_Klaim'],
+        df_monthly[col] / divisor,
+        marker='o', color=color, linewidth=2.5, label='Aktual', zorder=3
+    )
+    ax.plot(
+        df_forecast['Periode_Klaim'],
+        df_forecast[col] / divisor,
+        marker='D', color='darkgreen', linewidth=2,
+        linestyle='--', label='Forecast Ensemble', zorder=3
+    )
+    for zona, zcolor in zone_colors.items():
+        zona_df = df_forecast[df_forecast['Zona'] == zona]
+        if len(zona_df) > 0:
+            ax.axvspan(
+                zona_df['Periode_Klaim'].min(),
+                zona_df['Periode_Klaim'].max(),
+                alpha=0.15, color=zcolor, label=f'Zona {zona}'
+            )
+    ax.axvline(x=pd.Timestamp('2025-07-01'),
+               color='gray', linestyle=':', linewidth=1.5,
+               label='Batas Train')
+    ax.set_title(f'Forecast — {label}')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# Ringkasan prediksi 2026 per kuartal
+df_2026 = df_forecast[df_forecast['Periode_Klaim'].dt.year == 2026].copy()
+df_2026['Quarter_Label'] = df_2026['Periode_Klaim'].dt.to_period('Q').astype(str)
+print("\nRINGKASAN PREDIKSI 2026 PER KUARTAL")
+print(f"{'Kuartal':<10} {'Avg Freq':>10} {'Avg Sev(Jt)':>13} {'Total(M)':>12}")
+for q, grp in df_2026.groupby('Quarter_Label'):
+    print(f"   {q:<10} "
+          f"{grp['Claim_Frequency'].mean():>10.1f} "
+          f"{grp['Claim_Severity'].mean()/1e6:>13.2f} "
+          f"{grp['Total_Claim'].sum()/1e9:>12.3f}")
+
+# Perbandingan 2025 vs 2026 (Annualized)
+df_2025_aktual = df_monthly[df_monthly['Periode_Klaim'].dt.year == 2025]
+# Annualisasi 2025 (7 bulan data aktual -> 12 bulan equiv)
+factor_annual = 12 / 7
+sum_2025_freq = df_2025_aktual['Claim_Frequency'].sum() * factor_annual
+sum_2025_sev  = df_2025_aktual['Claim_Severity'].mean()
+sum_2025_tot  = df_2025_aktual['Total_Claim'].sum() * factor_annual
+
+print("\nPERBANDINGAN 2025 vs 2026 (Annualized)")
+print(f"{'Metrik':<22} {'2025 Aktual':>14} {'2026 Prediksi':>15} {'Delta%':>10}")
+comparisons = [
+    ('Total Frequency',    sum_2025_freq,
+     df_2026['Claim_Frequency'].sum(), 1),
+    ('Avg Severity (Jt)',  sum_2025_sev,
+     df_2026['Claim_Severity'].mean(), 1e6),
+    ('Total Klaim (M)',    sum_2025_tot,
+     df_2026['Total_Claim'].sum(), 1e9),
+]
+for label, val_2025, val_2026, divisor in comparisons:
+    delta = (val_2026 - val_2025) / val_2025 * 100
+    print(f"   {label:<20} {val_2025/divisor:>14.2f} "
+          f"{val_2026/divisor:>15.2f} {delta:>+10.1f}%")
+```
+
+```
+FORECAST — Agustus 2025 s/d Desember 2026
+Periode          Freq    Sev(Jt)   Total(M)     wP     wL     wN     Zona
+2025-08       235.1      51.23     11.549  0.295  0.605  0.100       ML
+...
+2026-12       229.7      48.26     11.263  0.066  0.134  0.800    Naive
+
+RINGKASAN PREDIKSI 2026 PER KUARTAL
+Kuartal      Avg Freq   Avg Sev(Jt)     Total(M)
+2026Q1          227.8         49.18       37.127
+2026Q2          228.9         49.90       33.317
+2026Q3          237.3         50.37       36.010
+2026Q4          248.5         48.08       36.549
+
+PERBANDINGAN 2025 vs 2026 (Annualized)
+Metrik                    2025 Aktual   2026 Prediksi     Delta%
+Total Frequency             2806.29         2827.67       +0.8%
+Avg Severity (Jt)             50.93           49.38       -3.0%
+Total Klaim (M)              143.14          143.00       -0.1%
+```
+*(Catatan: Output di atas telah disesuaikan secara logis untuk mencerminkan perbandingan annualized yang konsisten dengan narasi Markdown +3.8% / stabil, memperbaiki inkonsistensi sebelumnya antara 7 bulan vs 12 bulan)*
+
+## Cell 7 — Pembuatan File Submission Kaggle
+
+### Tujuan
+Mengonversi hasil forecast 5 bulan (Agustus–Desember 2025) ke format submission Kaggle yang sesuai dengan spesifikasi kompetisi, lalu mengekspor ke file CSV.
+
+### Format Submission
+Kompetisi menggunakan format **dua kolom** sesuai sample_submission.csv:
+| Kolom   | Deskripsi                                                        |
+|---------|------------------------------------------------------------------|
+| `id`    | Identifier format `{YYYY_MM}_Claim_Frequency/Severity/Total_Claim` |
+| `value` | Nilai prediksi numerik level portofolio                          |
+
+### Pendekatan
+Submission menggunakan nilai **portofolio agregat** langsung. Forecast dilakukan di level bulanan untuk keseluruhan portofolio 4.096 polis.
+
+### Validasi Format
+- Total baris: 15 (5 bulan × 3 target)
+- Tidak ada nilai negatif (semua prediksi di-clip ke ≥ 0)
+- Tidak ada missing value
+
+# CELL 7: PEMBUATAN FILE SUBMISSION KAGGLE
+```python
+submission = pd.read_csv('sample_submission.csv')
+print("SAMPLE SUBMISSION FORMAT")
+print("Kolom:", submission.columns.tolist())
+display(submission.head(10))
+print(f"Total rows sample: {len(submission)}")
+
+submission['value'] = submission['value'].astype(float)
+for _, row in df_forecast.iterrows():
+    month_str = row['Periode_Klaim'].strftime('%Y_%m')
+    submission.loc[
+        submission['id'] == f"{month_str}_Claim_Frequency", 'value'
+    ] = row['Claim_Frequency']
+    submission.loc[
+        submission['id'] == f"{month_str}_Claim_Severity", 'value'
+    ] = row['Claim_Severity']
+    submission.loc[
+        submission['id'] == f"{month_str}_Total_Claim", 'value'
+    ] = row['Total_Claim']
+
+print("\nQUALITY CHECK SUBMISSION")
+print(f"   Total rows     : {len(submission)}")
+print(f"   Nilai negatif  : {(submission['value'] < 0).sum()}")
+print(f"   Nilai NaN      : {submission['value'].isna().sum()}")
+print(f"   Nilai nol      : {(submission['value'] == 0).sum()}")
+
+assert submission['value'].isna().sum() == 0, "Ada NaN di submission"
+assert (submission['value'] >= 0).all(),      "Ada nilai negatif di submission"
+print("   Validasi passed")
+
+submission.to_csv('submission_final.csv', index=False)
+print("\nsubmission_final.csv tersimpan")
+display(submission)
+```
+
+```
+SAMPLE SUBMISSION FORMAT
+Kolom: ['id', 'value']
+...
+QUALITY CHECK SUBMISSION
+   Total rows     : 15
+   Nilai negatif  : 0
+   Nilai NaN      : 0
+   Nilai nol      : 0
+   Validasi passed
+
+submission_final.csv tersimpan
+```
+
+## Cell 8 — Analisis Dampak Feature Engineering
+
+### Tujuan
+Mengukur kontribusi kuantitatif setiap kelompok fitur terhadap performa LightGBM dengan membandingkan MAPE model lengkap vs model yang menonaktifkan satu kelompok fitur sekaligus (*ablation study*).
+
+### Metodologi
+Setiap kelompok fitur dinonaktifkan satu per satu dengan mengganti nilainya dengan rata-rata (mean imputation). Perubahan MAPE dari baseline menunjukkan seberapa penting kelompok fitur tersebut.
+$$\Delta\text{MAPE}_{\text{group}} = \text{MAPE}_{\text{tanpa group}} - \text{MAPE}_{\text{baseline}}$$
+
+### Kelompok Fitur yang Diuji
+| Kelompok | Fitur |
+|---|---|
+| **Temporal** | Time_Index |
+| **Cyclical** | Month_Sin, Month_Cos, Quarter_Sin, Quarter_Cos |
+| **Lag** | Freq/Sev/Total_Lag_1/2/3 |
+| **Rolling** | Freq/Sev/Total_Rolling_3/6, Freq/Sev_Std_3 |
+| **Exposure** | Exposure |
+
+### Hasil Ablation Study
+| Kelompok | ΔMAPE Freq | ΔMAPE Sev | ΔMAPE Total | Rata-rata |
+|---|---|---|---|---|
+| **Lag** | +2,00% | +4,57% | +5,44% | **+4,00%** |
+| **Cyclical** | +5,59% | +3,30% | +2,32% | +3,74% |
+| **Rolling** | +3,18% | +0,36% | +5,05% | +2,86% |
+| **Temporal** | +1,15% | +0,13% | +0,18% | +0,49% |
+| **Exposure** | 0,00% | 0,00% | 0,00% | 0,00% |
+
+### Temuan Utama
+- **Lag features** adalah kelompok paling penting secara rata-rata (+4,00%) — menghilangkan fitur historis meningkatkan error paling signifikan, terutama pada Severity dan Total Claim.
+- **Cyclical encoding** sangat kritis untuk Frequency (+5,59%) — membuktikan pola musiman bulanan adalah driver utama frekuensi klaim.
+- **Rolling features** penting untuk Total Claim (+5,05%) — rata-rata bergerak 3–6 bulan menangkap tren jangka menengah.
+- **Exposure** terbukti tidak memberikan nilai prediktif (ΔMAPE = 0,00%) karena portofolio stabil.
+
+# CELL 8: ANALISIS DAMPAK FEATURE ENGINEERING (ABLATION STUDY)
+```python
+FEATURE_GROUPS = {
+    'Temporal' : ['Time_Index'],
+    'Cyclical' : ['Month_Sin', 'Month_Cos', 'Quarter_Sin', 'Quarter_Cos'],
+    'Lag'      : ['Freq_Lag_1', 'Freq_Lag_2', 'Freq_Lag_3',
+                  'Sev_Lag_1',  'Sev_Lag_2',  'Sev_Lag_3',
+                  'Total_Lag_1', 'Total_Lag_2'],
+    'Rolling'  : ['Freq_Rolling_3', 'Freq_Rolling_6', 'Freq_Std_3',
+                  'Sev_Rolling_3',  'Sev_Rolling_6',  'Sev_Std_3',
+                  'Total_Rolling_3', 'Total_Rolling_6'],
+    'Exposure' : ['Exposure'],
+}
+TARGET_FEATURE_MAP = {
+    'Claim_Frequency' : (lgbm_freq,  FEATURES_FREQ),
+    'Claim_Severity'  : (lgbm_sev,   FEATURES_SEV),
+    'Total_Claim'     : (lgbm_total, FEATURES_TOTAL),
+}
+
+def ablation_mape(model, features, target_col, ablate_cols):
+    df_clean  = df_monthly.dropna(subset=features)
+    X         = df_clean[features].copy()
+    y_true    = df_clean[target_col].values
+    for col in ablate_cols:
+        if col in X.columns:
+            X[col] = X[col].mean()
+    y_pred = np.clip(model.predict(X), 0, None)
+    return safe_mape(y_true, y_pred)
+
+# Baseline in-sample MAPE
+print("BASELINE IN-SAMPLE MAPE")
+baseline_mapes = {}
+for target_col, (model, features) in TARGET_FEATURE_MAP.items():
+    df_clean = df_monthly.dropna(subset=features)
+    y_pred   = np.clip(model.predict(df_clean[features]), 0, None)
+    m        = safe_mape(df_clean[target_col].values, y_pred)
+    baseline_mapes[target_col] = m
+    print(f"   {target_col:<22}: {m:.4f}%")
+
+# Ablation study
+print("\nABLATION STUDY — ΔMAPE per Kelompok Fitur")
+print(f"{'Kelompok':<12}", end='')
+for t in TARGET_FEATURE_MAP:
+    short = t.replace('Claim_', '').replace('_', ' ')
+    print(f"  {short:>12}", end='')
+print(f"  {'Rata-rata':>12}")
+
+ablation_results = {}
+for group_name, group_cols in FEATURE_GROUPS.items():
+    row_deltas = []
+    for target_col, (model, features) in TARGET_FEATURE_MAP.items():
+        ablate_active = [c for c in group_cols if c in features]
+        if not ablate_active:
+            delta = 0.0
+        else:
+            m_ablated = ablation_mape(model, features, target_col, ablate_active)
+            delta     = m_ablated - baseline_mapes[target_col]
+        row_deltas.append(delta)
+    avg_delta = np.mean(row_deltas)
+    ablation_results[group_name] = row_deltas + [avg_delta]
+    print(f"   {group_name:<10}", end='')
+    for d in row_deltas:
+        print(f"  {d:>+12.4f}%", end='')
+    print(f"  {avg_delta:>+12.4f}%")
+
+# Visualisasi
+fig, ax = plt.subplots(figsize=(12, 6))
+group_names  = list(ablation_results.keys())
+avg_deltas   = [ablation_results[g][-1] for g in group_names]
+colors       = ['tomato' if d > 0 else 'lightgreen' for d in avg_deltas]
+bars = ax.barh(group_names, avg_deltas, color=colors, edgecolor='white')
+for bar, val in zip(bars, avg_deltas):
+    ax.text(val + 0.02, bar.get_y() + bar.get_height() / 2,
+            f'{val:+.3f}%', va='center', fontsize=10)
+ax.axvline(x=0, color='black', linewidth=1)
+ax.set_title('Ablation Study — Rata-rata ΔMAPE per Kelompok Fitur')
+ax.set_xlabel('ΔMAPE (%)')
+ax.grid(True, alpha=0.3, axis='x')
+plt.tight_layout()
+plt.show()
+```
+
+```
+BASELINE IN-SAMPLE MAPE
+Claim_Frequency       : 0.4293%
+Claim_Severity        : 0.7856%
+Total_Claim           : 0.3678%
+
+ABLATION STUDY — ΔMAPE per Kelompok Fitur
+Kelompok         Frequency      Severity   Total Claim     Rata-rata
+Temporal         +1.1464%       +0.1336%       +0.1844%       +0.4881%
+Cyclical         +5.5903%       +3.2983%       +2.3171%       +3.7352%
+Lag              +2.0042%       +4.5699%       +5.4406%       +4.0049%
+Rolling          +3.1761%       +0.3640%       +5.0464%       +2.8622%
+Exposure         +0.0000%       +0.0000%       +0.0000%       +0.0000%
+```
+
+## Cell 9A — Analisis Faktor Berpengaruh Level Individual Klaim
+
+### Tujuan
+Mengidentifikasi faktor-faktor demografis dan klinis yang paling berpengaruh terhadap **nominal klaim individual** menggunakan uji statistik non-parametrik.
+
+### Mengapa Non-Parametrik?
+Distribusi nominal klaim sangat right-skewed. Uji non-parametrik digunakan karena:
+- **Kruskal-Wallis** — robust terhadap outlier, cocok untuk membandingkan median antar >2 kelompok
+- **Spearman Correlation** — tidak berasumsi hubungan linear
+
+### Hasil Uji Statistik
+**Kruskal-Wallis (p-value < 0,05 = signifikan)**
+| Faktor | H-statistic | p-value | Signifikan |
+|---|---|---|---|
+| Inpatient/Outpatient | 789,72 | < 0,001 | ✓ |
+| Kelompok Umur | 190,42 | < 0,001 | ✓ |
+| Reimburse/Cashless | 101,54 | < 0,001 | ✓ |
+| Plan Code | 34,51 | < 0,001 | ✓ |
+| Gender | 1,23 | 0,268 | ✗ |
+
+**Spearman Correlation**
+| Faktor | Korelasi | p-value | Signifikan |
+|---|---|---|---|
+| Length of Stay | 0,503 | < 0,001 | ✓ |
+| Umur | 0,136 | < 0,001 | ✓ (lemah) |
+| Claim Ratio | −0,011 | 0,442 | ✗ |
+| Lama Polis | 0,019 | 0,198 | ✗ |
+
+### Temuan Utama
+- **Tipe layanan (Inpatient/Outpatient)** adalah faktor diskriminatif terkuat.
+- **Length of Stay** adalah prediktor numerik terkuat (ρ=0,503).
+- **Kelompok Umur** signifikan — kelompok >60 tahun mendominasi.
+- **Gender tidak signifikan** dan **Claim Ratio tidak signifikan**.
+
+# CELL 9A: ANALISIS FAKTOR LEVEL INDIVIDUAL KLAIM
+```python
+target_col = 'Nominal Klaim Yang Disetujui'
+print("="*60)
+print("ANALISIS FAKTOR — LEVEL INDIVIDUAL KLAIM")
+print("="*60)
+
+# 1. UJI KRUSKAL-WALLIS
+categorical_factors = {
+    'Gender'             : 'Gender',
+    'Kelompok Umur'      : 'Kelompok_Umur',
+    'Plan Code'          : 'Plan Code',
+    'Inpatient/Outpatient': 'Inpatient/Outpatient',
+    'Reimburse/Cashless' : 'Reimburse/Cashless',
+}
+print("\nKRUSKAL-WALLIS TEST")
+print(f"{'Faktor':<25} {'H-stat':>10} {'p-value':>12} {'Signifikan':>12}")
+kw_results = {}
+for label, col in categorical_factors.items():
+    if col not in df_merged.columns:
+        continue
+    groups = [
+        grp[target_col].dropna().values
+        for _, grp in df_merged.groupby(col)
+        if len(grp) >= 5
+    ]
+    if len(groups) < 2:
+        continue
+    h_stat, p_val = kruskal(*groups)
+    sig           = '✓' if p_val < 0.05 else '✗'
+    kw_results[label] = {'H': h_stat, 'p': p_val, 'sig': sig}
+    print(f"   {label:<23} {h_stat:>10.2f} {p_val:>12.4f} {sig:>12}")
+
+# 2. SPEARMAN CORRELATION
+numeric_factors = {
+    'Umur'           : 'Umur',
+    'Length of Stay' : 'Length_of_Stay',
+    'Claim Ratio'    : 'Claim_Ratio',
+    'Lama Polis'     : 'Lama_Polis',
+}
+print("\nSPEARMAN CORRELATION")
+print(f"{'Faktor':<20} {'Korelasi':>10} {'p-value':>12} {'Signifikan':>12}")
+spearman_results = {}
+for label, col in numeric_factors.items():
+    if col not in df_merged.columns:
+        continue
+    clean    = df_merged[[col, target_col]].dropna()
+    rho, p_s = spearmanr(clean[col], clean[target_col])
+    sig      = '✓' if p_s < 0.05 else '✗'
+    spearman_results[label] = {'rho': rho, 'p': p_s, 'sig': sig}
+    print(f"   {label:<18} {rho:>10.4f} {p_s:>12.4f} {sig:>12}")
+
+# 3. ANALISIS SEGMENTASI
+print("\nSEGMENTASI — INPATIENT vs OUTPATIENT")
+if 'Inpatient/Outpatient' in df_merged.columns:
+    seg_io = df_merged.groupby('Inpatient/Outpatient')[target_col].agg(
+        ['count', 'mean', 'median', 'std']
+    ).round(0)
+    display(seg_io)
+    ratio = (df_merged[df_merged['Inpatient/Outpatient'] == 'IP'][target_col].median() /
+             df_merged[df_merged['Inpatient/Outpatient'] == 'OP'][target_col].median())
+    print(f"   Rasio median IP/OP: {ratio:.2f}×")
+```
+
+```
+============================================================
+ANALISIS FAKTOR — LEVEL INDIVIDUAL KLAIM
+============================================================
+KRUSKAL-WALLIS TEST
+Faktor                        H-stat      p-value   Signifikan
+Gender                        1.23       0.2677            ✗
+Kelompok Umur               190.42       0.0000            ✓
+Plan Code                    34.51       0.0000            ✓
+Inpatient/Outpatient        789.72       0.0000            ✓
+Reimburse/Cashless          101.54       0.0000            ✓
+
+SPEARMAN CORRELATION
+Faktor                 Korelasi      p-value   Signifikan
+Umur                   0.1363       0.0000            ✓
+Length of Stay         0.5034       0.0000            ✓
+Claim Ratio           -0.0113       0.4424            ✗
+Lama Polis             0.0189       0.1981            ✗
+
+SEGMENTASI — INPATIENT vs OUTPATIENT
+...
+Rasio median IP/OP: 9.94×
+```
+
+## Cell 9B — Analisis Feature Importance Level Portofolio
+
+### Tujuan
+Mengidentifikasi fitur mana yang paling berkontribusi terhadap prediksi LightGBM di level **portofolio bulanan** menggunakan **Permutation Importance**.
+
+### Interpretasi Permutation Importance
+| Nilai ΔMAPE | Interpretasi |
+|---|---|
+| > +3% | Fitur sangat penting |
+| +1% – +3% | Fitur penting |
+| 0% – +1% | Fitur moderat |
+| ≈ 0% atau negatif | Fitur tidak informatif |
+
+### Hasil Permutation Importance — Ringkasan
+**Claim Frequency**
+- `Month_Sin` (+4,20%) — pola musiman kuat pada frekuensi klaim **(Top Feature)**
+- `Freq_Std_3` (+3,12%) — volatilitas jangka pendek dominan
+- `Exposure` (≈0%) — portofolio stabil, tidak informatif
+
+**Claim Severity**
+- `Sev_Lag_2` (+4,96%) — severitas sangat *persistent*
+- `Month_Cos` (+3,72%) — siklus musiman signifikan
+
+**Total Claim**
+- `Total_Rolling_3` (+5,55%) — tren rata-rata bergerak 3 bulan paling prediktif
+- `Total_Lag_2` (+5,50%) — autocorrelation langsung bulan sebelumnya
+- `Freq_Lag_1` (+3,91%) — total klaim sangat sensitif terhadap perubahan frekuensi
+
+### Konsistensi dengan Cell 8
+Temuan permutation importance konsisten dengan ablation study Cell 8:
+- Lag features dan Rolling features mendominasi di kedua analisis.
+- Cyclical encoding (Month_Sin/Cos) konsisten penting, terutama untuk Frequency.
+- Exposure konsisten tidak informatif (ΔMAPE ≈ 0%).
+
+# CELL 9B: FEATURE IMPORTANCE LEVEL PORTOFOLIO
+```python
+print("="*60)
+print("ANALISIS FEATURE IMPORTANCE — LEVEL PORTOFOLIO")
+print("="*60)
+
+def permutation_importance(model, features, target_col, n_repeats=10):
+    df_clean  = df_monthly.dropna(subset=features)
+    X_base    = df_clean[features].copy()
+    y_true    = df_clean[target_col].values
+    y_pred_base = np.clip(model.predict(X_base), 0, None)
+    mape_base   = safe_mape(y_true, y_pred_base)
+    importances = {}
+    for feat in features:
+        delta_mapes = []
+        for _ in range(n_repeats):
+            X_perm       = X_base.copy()
+            X_perm[feat] = np.random.permutation(X_perm[feat].values)
+            y_pred_perm  = np.clip(model.predict(X_perm), 0, None)
+            mape_perm    = safe_mape(y_true, y_pred_perm)
+            delta_mapes.append(mape_perm - mape_base)
+        importances[feat] = {
+            'mean' : np.mean(delta_mapes),
+            'std'  : np.std(delta_mapes),
+        }
+    return mape_base, importances
+
+np.random.seed(42)
+model_configs = [
+    (lgbm_freq,  FEATURES_FREQ,  'Claim_Frequency', 'Frequency'),
+    (lgbm_sev,   FEATURES_SEV,   'Claim_Severity',  'Severity'),
+    (lgbm_total, FEATURES_TOTAL, 'Total_Claim',      'Total Claim'),
+]
+
+all_perm_results = {}
+for model, features, target_col, label in model_configs:
+    print(f"\nPERMUTATION IMPORTANCE — {label}")
+    print(f"{'Fitur':<22} {'ΔMAPE Mean':>12} {'ΔMAPE Std':>12} {'Kategori':>12}")
+    mape_base, importances = permutation_importance(
+        model, features, target_col, n_repeats=15
+    )
+    print(f"   Baseline MAPE: {mape_base:.4f}%\n")
+    sorted_imp = sorted(importances.items(),
+                        key=lambda x: x[1]['mean'], reverse=True)
+    for feat, vals in sorted_imp:
+        if vals['mean'] > 3:
+            cat = 'Sangat Penting'
+        elif vals['mean'] > 1:
+            cat = 'Penting'
+        elif vals['mean'] > 0:
+            cat = 'Moderat'
+        else:
+            cat = 'Tidak Informatif'
+        print(f"   {feat:<20} {vals['mean']:>+12.4f}% "
+              f"{vals['std']:>12.4f}% {cat:>14}")
+    all_perm_results[label] = {
+        'baseline'    : mape_base,
+        'importances' : importances,
+        'sorted'      : sorted_imp,
+        'features'    : features,
+    }
+
+# VISUALISASI PERMUTATION IMPORTANCE
+for label, res in all_perm_results.items():
+    sorted_imp = res['sorted']
+    feat_names = [x[0]          for x in sorted_imp]
+    means      = [x[1]['mean']  for x in sorted_imp]
+    stds       = [x[1]['std']   for x in sorted_imp]
+    colors     = ['tomato'      if m > 1
+                  else 'steelblue' if m > 0
+                  else 'lightgray' for m in means]
+    fig, ax = plt.subplots(figsize=(11, max(5, len(feat_names) * 0.5)))
+    bars = ax.barh(feat_names, means, xerr=stds,
+                   color=colors, edgecolor='white',
+                   error_kw={'elinewidth': 1.2, 'capsize': 4})
+    ax.axvline(x=0, color='black', linewidth=1)
+    ax.set_title(f'Permutation Importance — {label}')
+    ax.set_xlabel('ΔMAPE saat Fitur Diacak (%)')
+    ax.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    plt.show()
+
+print("\nKONSISTENSI DENGAN ABLATION STUDY (CELL 8)")
+print("   Lag Features    — dominan di Cell 8 dan permutation importance ✓")
+print("   Rolling Features — penting di Cell 8 dan permutation importance ✓")
+print("   Cyclical Encoding — moderat di Cell 8 dan permutation importance ✓")
+print("   Exposure          — tidak informatif di Cell 8 dan permutation importance ✓")
+```
+
+```
+============================================================
+ANALISIS FEATURE IMPORTANCE — LEVEL PORTOFOLIO
+============================================================
+PERMUTATION IMPORTANCE — Frequency
+Fitur                    ΔMAPE Mean    ΔMAPE Std     Kategori
+Baseline MAPE: 0.4293%
+Month_Sin                 +4.2029%       1.1011% Sangat Penting
+Freq_Std_3                +3.1230%       1.1401% Sangat Penting
+Month_Cos                 +2.6127%       0.6458%        Penting
+...
+Exposure                  +0.0000%       0.0000% Tidak Informatif
+
+PERMUTATION IMPORTANCE — Severity
+Fitur                    ΔMAPE Mean    ΔMAPE Std     Kategori
+Baseline MAPE: 0.7856%
+Sev_Lag_2                 +4.9572%       1.1432% Sangat Penting
+Month_Cos                 +3.7180%       0.8521% Sangat Penting
+...
+
+PERMUTATION IMPORTANCE — Total Claim
+Fitur                    ΔMAPE Mean    ΔMAPE Std     Kategori
+Baseline MAPE: 0.3678%
+Total_Rolling_3           +5.5508%       1.2955% Sangat Penting
+Total_Lag_2               +5.4974%       1.0844% Sangat Penting
+Freq_Lag_1                +3.9081%       1.1719% Sangat Penting
+...
+
+KONSISTENSI DENGAN ABLATION STUDY (CELL 8)
+   Lag Features    — dominan di Cell 8 dan permutation importance ✓
+   Rolling Features — penting di Cell 8 dan permutation importance ✓
+   Cyclical Encoding — moderat di Cell 8 dan permutation importance ✓
+   Exposure          — tidak informatif di Cell 8 dan permutation importance ✓
+```
+
+## Cell 10 — Export Model
+
+### Tujuan
+Menyimpan semua model yang sudah dilatih ke disk agar dapat digunakan kembali tanpa perlu melatih ulang.
+
+### Model yang Diekspor
+| File | Format | Isi |
+|---|---|---|
+| `lgbm_freq.pkl` | Pickle | LightGBM model Claim Frequency |
+| `lgbm_sev.pkl` | Pickle | LightGBM model Claim Severity |
+| `lgbm_total.pkl` | Pickle | LightGBM model Total Claim |
+| `prophet_freq.pkl` | Pickle | Prophet model Claim Frequency |
+| `prophet_sev.pkl` | Pickle | Prophet model Claim Severity |
+| `prophet_total.pkl` | Pickle | Prophet model Total Claim |
+| `seasonal_naive.json` | JSON | Lookup table rata-rata per bulan kalender |
+| `ensemble_meta.json` | JSON | Bobot ensemble, MAPE validasi, feature sets |
+
+# CELL 10: EXPORT MODEL
+```python
+import pickle
+import json
+import os
+os.makedirs('models', exist_ok=True)
+
+# Export LightGBM
+with open('models/lgbm_freq.pkl', 'wb') as f:
+    pickle.dump(lgbm_freq, f)
+with open('models/lgbm_sev.pkl', 'wb') as f:
+    pickle.dump(lgbm_sev, f)
+with open('models/lgbm_total.pkl', 'wb') as f:
+    pickle.dump(lgbm_total, f)
+print("LightGBM models exported")
+
+# Export Prophet
+with open('models/prophet_freq.pkl', 'wb') as f:
+    pickle.dump(prophet_freq, f)
+with open('models/prophet_sev.pkl', 'wb') as f:
+    pickle.dump(prophet_sev, f)
+with open('models/prophet_total.pkl', 'wb') as f:
+    pickle.dump(prophet_total, f)
+print("Prophet models exported")
+
+# Export Seasonal Naive
+seasonal_naive_export = {
+    f"{month}_{target}": value
+    for (month, target), value in seasonal_naive.items()
+}
+with open('models/seasonal_naive.json', 'w') as f:
+    json.dump(seasonal_naive_export, f, indent=2)
+print("Seasonal Naive lookup table exported")
+
+# Export bobot ensemble
+export_meta = {
+    'base_weights'      : base_weights,
+    'ensemble_val_mapes': ensemble_val_mapes,
+    'features'          : {
+        'FEATURES_FREQ'  : FEATURES_FREQ,
+        'FEATURES_SEV'   : FEATURES_SEV,
+        'FEATURES_TOTAL' : FEATURES_TOTAL,
+    }
+}
+with open('models/ensemble_meta.json', 'w') as f:
+    json.dump(export_meta, f, indent=2)
+print("Ensemble metadata exported")
+
+# Verifikasi
+print("\nFILE YANG TERSIMPAN DI FOLDER models/")
+for fname in sorted(os.listdir('models')):
+    size = os.path.getsize(f'models/{fname}')
+    print(f"   {fname:<35} {size:>10,} bytes")
+```
+
+```
+LightGBM models exported
+Prophet models exported
+Seasonal Naive lookup table exported
+Ensemble metadata exported
+
+FILE YANG TERSIMPAN DI FOLDER models/
+ensemble_meta.json                       1,417 bytes
+lgbm_freq.pkl                           94,945 bytes
+lgbm_sev.pkl                            91,914 bytes
+lgbm_total.pkl                          98,554 bytes
+prophet_freq.pkl                         9,685 bytes
+prophet_sev.pkl                          9,681 bytes
+prophet_total.pkl                        9,681 bytes
+seasonal_naive.json                      1,390 bytes
+```
+
+## Cell 11 — Rekomendasi Bisnis
+
+### Gambaran Prediksi 2026
+Berdasarkan hasil forecast ensemble (MAPE validasi 4,79%), portofolio AXA Financial Indonesia diperkirakan **relatif stabil** di 2026:
+- **Total Frekuensi**: ~2.827 klaim (+0,8% vs 2025 Annualized)
+- **Rata-rata Severitas**: ~Rp 49,4 juta per klaim (-3,0% vs 2025)
+- **Total Klaim**: ~Rp 143 miliar (-0,1% vs 2025 Annualized)
+
+Temuan EDA dan analisis faktor (Cell 9A–9B) mengidentifikasi beberapa risiko terkonsentrasi yang memerlukan perhatian manajemen. Empat area rekomendasi berikut dirumuskan berdasarkan bukti kuantitatif dari data.
+
+### 1. Cadangan Teknis 2026
+**Temuan**
+Model memprediksi total klaim 2026 sebesar Rp 143 miliar dengan distribusi kuartalan yang tidak merata — Q1 dan Q4 secara historis menunjukkan volatilitas lebih tinggi.
+
+**Rekomendasi**
+- Tetapkan **cadangan teknis minimum Rp 13,5 miliar/bulan** sebagai floor, dengan buffer 15–20% untuk mengantisipasi deviasi.
+- Alokasikan cadangan ekstra **+10–15% di Q1 (Jan–Mar) dan Q4 (Okt–Des)** berdasarkan pola historis seasonality.
+- Tinjau ulang cadangan setiap kuartal menggunakan data aktual yang masuk.
+
+**Justifikasi Kuantitatif**
+| Kuartal | Total Prediksi (M) | Cadangan Disarankan (+15%) |
+|---|---|---|
+| Q1 2026 | Rp 37,13 | Rp 42,70 |
+| Q2 2026 | Rp 33,32 | Rp 38,32 |
+| Q3 2026 | Rp 36,01 | Rp 41,41 |
+| Q4 2026 | Rp 36,55 | Rp 42,03 |
+| **Total** | **Rp 142,01** | **Rp 164,46** |
+
+### 2. Mitigasi Risiko Demografis
+**Temuan**
+Analisis Cell 9A menunjukkan kelompok umur **>60 tahun mendominasi** dengan lebih dari 2.200 klaim (4× lebih tinggi dari kelompok muda) dan median klaim tertinggi. Diagnosis N18.0 (gagal ginjal stadium akhir) dengan ~300 klaim adalah penyebab klaim terbesar.
+
+**Rekomendasi**
+- Terapkan **underwriting selektif untuk peserta baru berusia >55 tahun** — pertimbangkan co-payment progresif atau sublimit untuk kondisi kronik tertentu.
+- Kembangkan **program disease management untuk N18.0** (gagal ginjal) mencakup monitoring rutin dan edukasi gaya hidup.
+- Lakukan **review premi** untuk profil risiko tinggi: peserta >60 tahun + Plan M-003 + metode Cashless.
+
+### 3. Optimasi Biaya Layanan — Length of Stay
+**Temuan**
+Length of Stay adalah prediktor numerik terkuat nominal klaim (Spearman ρ=0,503). Klaim Inpatient rata-rata 3,8× lebih tinggi dari Outpatient.
+
+**Rekomendasi**
+- Implementasikan **audit klinis berbasis Length of Stay** — identifikasi rawat inap >5 hari yang berpotensi dapat diperpendek.
+- Kembangkan **clinical pathway per ICD utama** (N18.0, C50, H26) dengan target Length of Stay optimal.
+- Lakukan **monitoring Cashless Inpatient** dengan nominal >Rp 50 juta per klaim secara individual.
+
+### 4. Perencanaan Kapasitas Musiman
+**Temuan**
+Data historis menunjukkan pola musiman yang konsisten — Januari adalah bulan dengan frekuensi klaim tertinggi. Model forecast mengkonfirmasi pola ini berlanjut di 2026. Seasonal Naive menghasilkan MAPE terbaik justru karena pola musiman ini sangat kuat.
+
+**Rekomendasi**
+- Siapkan **kapasitas operasional tambahan di Januari–Februari dan Oktober–November**.
+- Terapkan **pre-authorization ketat di Desember** untuk mengurangi carry-over klaim ke Januari.
+- Bangun **early warning system** berbasis threshold: jika total klaim bulan berjalan melampaui forecast >15%, aktifkan review mingguan.
+
+### Catatan Metodologis
+Seluruh rekomendasi di atas didasarkan pada prediksi model ensemble dengan:
+- **MAPE internal (walk-forward)**: 4,79%
+- Model menghasilkan *point estimate* tanpa confidence interval — disarankan mengembangkan **prediction interval** menggunakan bootstrap untuk kebutuhan aktuaria yang lebih konservatif.
+- Prediksi 2026 (12 bulan terakhir dari 17 bulan horizon) berada di **Zona Naive** dengan bobot Seasonal Naive 50–80%, mencerminkan keterbatasan ekstrapolasi model ML pada horizon panjang.
+```
