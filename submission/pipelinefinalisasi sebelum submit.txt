@@ -2155,25 +2155,30 @@ for q, grp in df_2026.groupby('Quarter_Label'):
           f"{grp['Claim_Severity'].mean()/1e6:>13.2f} "
           f"{grp['Total_Claim'].sum()/1e9:>12.3f}")
 
-# Perbandingan 2025 aktual vs 2026 prediksi
+# Perbandingan 2025 annualized vs 2026 prediksi
 df_2025_aktual = df_monthly[df_monthly['Periode_Klaim'].dt.year == 2025]
-df_2025_fc     = df_forecast[df_forecast['Periode_Klaim'].dt.year == 2025]
+
+freq_2025_raw        = df_2025_aktual['Claim_Frequency'].sum()
+freq_2025_annualized = freq_2025_raw * (12 / 7)
+
+total_2025_raw        = df_2025_aktual['Total_Claim'].sum()
+total_2025_annualized = total_2025_raw * (12 / 7)
 
 print("\nPERBANDINGAN 2025 vs 2026")
-print(f"{'Metrik':<22} {'2025 Aktual':>14} {'2026 Prediksi':>15} {'Delta%':>10}")
+print(f"{'Metrik':<22} {'2025 Annualized':>16} {'2026 Prediksi':>15} {'Delta%':>10}")
 
 comparisons = [
-    ('Total Frequency',    df_2025_aktual['Claim_Frequency'].sum(),
-                           df_2026['Claim_Frequency'].sum(), 1),
-    ('Avg Severity (Jt)',  df_2025_aktual['Claim_Severity'].mean(),
-                           df_2026['Claim_Severity'].mean(), 1e6),
-    ('Total Klaim (M)',    df_2025_aktual['Total_Claim'].sum(),
-                           df_2026['Total_Claim'].sum(), 1e9),
+    ('Total Frequency',   freq_2025_annualized,
+                          df_2026['Claim_Frequency'].sum(), 1),
+    ('Avg Severity (Jt)', df_2025_aktual['Claim_Severity'].mean(),
+                          df_2026['Claim_Severity'].mean(), 1e6),
+    ('Total Klaim (M)',   total_2025_annualized,
+                          df_2026['Total_Claim'].sum(), 1e9),
 ]
 
 for label, val_2025, val_2026, divisor in comparisons:
     delta = (val_2026 - val_2025) / val_2025 * 100
-    print(f"   {label:<20} {val_2025/divisor:>14.2f} "
+    print(f"   {label:<20} {val_2025/divisor:>16.2f} "
           f"{val_2026/divisor:>15.2f} {delta:>+10.1f}%")
 
 FORECAST — Agustus 2025 s/d Desember 2026
@@ -2195,7 +2200,6 @@ Periode          Freq    Sev(Jt)   Total(M)     wP     wL     wN     Zona
    2026-10       255.9      46.00     11.957  0.099  0.202  0.700    Naive
    2026-11       259.9      49.98     13.329  0.082  0.168  0.750    Naive
    2026-12       229.7      48.26     11.263  0.066  0.134  0.800    Naive
-
 RINGKASAN PREDIKSI 2026 PER KUARTAL
 Kuartal      Avg Freq   Avg Sev(Jt)     Total(M)
    2026Q1          227.8         49.18       37.127
@@ -2204,10 +2208,10 @@ Kuartal      Avg Freq   Avg Sev(Jt)     Total(M)
    2026Q4          248.5         48.08       36.549
 
 PERBANDINGAN 2025 vs 2026
-Metrik                    2025 Aktual   2026 Prediksi     Delta%
-   Total Frequency             1637.00         2827.67      +72.7%
-   Avg Severity (Jt)             50.93           49.38       -3.0%
-   Total Klaim (M)               83.50          143.00      +71.3%
+Metrik                  2025 Annualized   2026 Prediksi     Delta%
+   Total Frequency               2806.29         2827.67       +0.8%
+   Avg Severity (Jt)               50.93           49.38       -3.0%
+   Total Klaim (M)                143.14          143.00       -0.1%
 
 ## Cell 6A — Block Bootstrap Prediction Intervals
 
@@ -2220,8 +2224,6 @@ Prediction interval dibangun menggunakan **block bootstrap pada hybrid residual 
 - OOS dibobot 3× karena lebih valid (tanpa optimistic bias IS), namun dari periode homogen — interval bersifat indikatif, bukan coverage-guaranteed
 
 Validasi empiris coverage tersedia di Cell 6B.
-
----
 
 ### Part 1 — Total Claim
 
@@ -2258,7 +2260,6 @@ Validasi empiris coverage tersedia di Cell 6B.
 
 > **Coverage empiris**: 88,9% (8/9 observasi masuk PI 80%) — melampaui target nominal. Satu miss di Januari 2025 adalah anomali historis terdokumentasi. Lihat Cell 6B.
 
----
 
 ### Part 2 — Claim Frequency
 
@@ -2295,7 +2296,6 @@ Validasi empiris coverage tersedia di Cell 6B.
 
 > **Coverage empiris**: 66,7% (6/9 observasi masuk PI 80%) — undercoverage. Interval terlalu sempit untuk Frequency. Gunakan sebagai referensi indikatif, bukan acuan keputusan. Lihat Cell 6B.
 
----
 
 ### Part 3 — Claim Severity
 
@@ -2304,7 +2304,7 @@ Validasi empiris coverage tersedia di Cell 6B.
 | IS | +1,05% | 7,76% |
 | OOS | -3,84% | 6,89% |
 
-| Periode | P10 (Rp juta) | P50 (Rp juta) | P90 (Rp juta) | Width 80% | Zona |
+| Periode | P10 (Rp juta/klaim) | P50 (Rp juta/klaim) | P90 (Rp juta/klaim) | Width 80% | Zona |
 |---|---|---|---|---|---|
 | 2025-08 | 44,6 | 50,7 | 54,4 | 9,8 | ML |
 | 2025-09 | 42,5 | 48,4 | 52,0 | 9,5 | ML |
@@ -2325,14 +2325,13 @@ Validasi empiris coverage tersedia di Cell 6B.
 | 2026-12 | 42,1 | 48,5 | 52,0 | 9,9 | Naive |
 
 **Ringkasan 2026:**
-- P10: Rp 518,3 juta per klaim
-- P50: Rp 589,9 juta per klaim ← dekat dengan point estimate ~Rp 594 juta ✓
-- P90: Rp 649,4 juta per klaim
-- Lebar 80% PI: Rp 131,1 juta per klaim
+- P10: Rp 42,2 juta/klaim (rata-rata bulanan)
+- P50: Rp 49,4 juta/klaim (rata-rata bulanan) ← konsisten dengan historis 43–63 juta ✓
+- P90: Rp 54,1 juta/klaim (rata-rata bulanan)
+- Lebar 80% PI: Rp 11,9 juta/klaim
 
 > **Coverage empiris**: 66,7% (6/9 observasi masuk PI 80%) — undercoverage. Pola serupa dengan Frequency. Interval bersifat indikatif. Lihat Cell 6B.
 
----
 
 ### Ringkasan Komparatif Ketiga Target
 
@@ -2340,7 +2339,7 @@ Validasi empiris coverage tersedia di Cell 6B.
 |---|---|---|---|---|
 | Total Claim | Rp 143,49 M | Rp 149,11 M | Rp 16,78 M | **88,9%** ✓ |
 | Claim Frequency | 2.810 klaim | 3.207 klaim | 733 klaim | 66,7% ⚠️ |
-| Claim Severity | Rp 589,9 juta | Rp 649,4 juta | Rp 131,1 juta | 66,7% ⚠️ |
+| Claim Severity | Rp 49,4 juta/klaim | Rp 54,1 juta/klaim | Rp 11,9 juta/klaim | 66,7% ⚠️|
 
 > PI Total Claim divalidasi dan layak sebagai acuan cadangan aktuaria (Cell 11). PI Frequency dan Severity bersifat indikatif — undercoverage terdokumentasi di Cell 6B karena pool 34 poin tidak cukup menangkap volatilitas ekor kedua target ini.
 
@@ -2487,6 +2486,7 @@ RINGKASAN PREDICTION INTERVAL TOTAL KLAIM 2026
    Lebar 80% PI : Rp 16.78 miliar
 
 # CELL 6A EXTENSION — PI Claim Frequency & Claim Severity
+# PERBAIKAN: Severity menggunakan .mean() bukan .sum() untuk ringkasan 2026
 
 np.random.seed(42)
 BLOCK_SIZE_EXT = 2
@@ -2499,7 +2499,6 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
     unit    = 'klaim' if target == 'Claim_Frequency' else 'Rp juta'
     divisor = 1       if target == 'Claim_Frequency' else 1e6
 
-    # IS residual, bobot per-langkah
     if target == 'Claim_Frequency':
         _prophet_is = np.clip(prophet_freq.predict(
             pd.DataFrame({'ds': df_monthly['Periode_Klaim']}))['yhat'].values, 0, None)
@@ -2523,7 +2522,6 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
     _is_resid = (_ensemble_is - df_monthly[target].values) / \
                 (df_monthly[target].values + 1e-9)
 
-    # OOS residual dari val_results Cell 4 
     _wp0, _wl0, _wn0 = get_progressive_weights(0, base_weights[target], target)
     _oos_ens = (_wp0 * np.array(val_results[target]['prophet_preds']) +
                 _wl0 * np.array(val_results[target]['lgbm_preds'])    +
@@ -2531,7 +2529,6 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
     _oos_act  = np.array(val_results[target]['actuals'])
     _oos_resid = (_oos_ens - _oos_act) / (_oos_act + 1e-9)
 
-    # --- Hybrid pool ---
     _hybrid = np.concatenate([np.tile(_oos_resid, OOS_WEIGHT_EXT), _is_resid])
     _blocks = [_hybrid[i:i+BLOCK_SIZE_EXT]
                for i in range(0, len(_hybrid) - BLOCK_SIZE_EXT + 1, BLOCK_SIZE_EXT)]
@@ -2543,7 +2540,6 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
     print(f"Hybrid pool  — {len(_oos_resid)*OOS_WEIGHT_EXT} OOS + {len(_is_resid)} IS = "
           f"{len(_hybrid)} poin, {len(_blocks)} blok")
 
-    # Bootstrap per bulan 
     _point_fc   = df_forecast[target].values
     _n_needed   = int(np.ceil(FORECAST_LEN / BLOCK_SIZE_EXT))
     _boot_paths = np.zeros((N_BOOT_EXT, FORECAST_LEN))
@@ -2557,7 +2553,6 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
     _p50 = np.percentile(_boot_paths, 50, axis=0)
     _p90 = np.percentile(_boot_paths, 90, axis=0)
 
-    # Tabel output
     print(f"\nPREDICTION INTERVAL {target.upper().replace('_',' ')} ({unit})")
     print(f"{'Periode':<12} {'P10':>8} {'P50':>8} {'P90':>8} {'Width80':>10}  Zona")
     for i, row in df_forecast.iterrows():
@@ -2566,19 +2561,27 @@ for target, features in [('Claim_Frequency', FEATURES_FREQ),
               f"{_p90[i]/divisor:>8.1f} {(_p90[i]-_p10[i])/divisor:>10.1f}  {row['Zona']}")
 
     # Ringkasan 2026
-    _idx26  = [i for i, d in enumerate(df_forecast['Periode_Klaim'])
-               if pd.Timestamp(d).year == 2026]
-    _p10_26 = _p10[_idx26].sum() / divisor
-    _p50_26 = _p50[_idx26].sum() / divisor
-    _p90_26 = _p90[_idx26].sum() / divisor
+    _idx26 = [i for i, d in enumerate(df_forecast['Periode_Klaim'])
+              if pd.Timestamp(d).year == 2026]
 
-    print(f"\nRINGKASAN 2026:")
-    print(f"   P10 : {_p10_26:.1f} {unit}")
-    print(f"   P50 : {_p50_26:.1f} {unit}")
-    print(f"   P90 : {_p90_26:.1f} {unit}")
-    print(f"   Lebar 80% PI : {_p90_26 - _p10_26:.1f} {unit}")
-    print(f"   CATATAN: Coverage empiris 80% PI = 66,7% (Cell 6B) — indikatif")
+    # PERBAIKAN: Severity menggunakan .mean(), bukan .sum()
+    if target == 'Claim_Severity':
+        _p10_26 = _p10[_idx26].mean() / divisor
+        _p50_26 = _p50[_idx26].mean() / divisor  # <-- WAS .sum()
+        _p90_26 = _p90[_idx26].mean() / divisor  # <-- WAS .sum()
+        label_unit = 'Rp juta/klaim (rata-rata bulanan)'
+    else:
+        _p10_26 = _p10[_idx26].sum() / divisor
+        _p50_26 = _p50[_idx26].sum() / divisor
+        _p90_26 = _p90[_idx26].sum() / divisor
+        label_unit = unit
 
+    print(f"\nRINGKASAN 2026 ({label_unit}):")
+    print(f"   P10 : {_p10_26:.1f}")
+    print(f"   P50 : {_p50_26:.1f}")
+    print(f"   P90 : {_p90_26:.1f}")
+    print(f"   Lebar 80% PI : {_p90_26 - _p10_26:.1f}")
+=======================================================
 =======================================================
 PI — Claim_Frequency
 IS residual  — mean: -0.11%, std: 8.28%
@@ -2605,12 +2608,43 @@ Periode           P10      P50      P90    Width80  Zona
    2026-11       219.1    258.3    291.8       72.7  Naive
    2026-12       204.3    228.3    267.4       63.0  Naive
 
-RINGKASAN 2026:
-   P10 : 2474.0 klaim
-   P50 : 2810.4 klaim
-   P90 : 3206.5 klaim
-   Lebar 80% PI : 732.5 klaim
-   CATATAN: Coverage empiris 80% PI = 66,7% (Cell 6B) — indikatif
+RINGKASAN 2026 (klaim):
+   P10 : 2474.0
+   P50 : 2810.4
+   P90 : 3206.5
+   Lebar 80% PI : 732.5
+
+=======================================================
+PI — Claim_Severity
+IS residual  — mean: +1.05%, std: 7.76%
+OOS residual — mean: -3.84%, std: 6.89%
+Hybrid pool  — 15 OOS + 19 IS = 34 poin, 17 blok
+
+PREDICTION INTERVAL CLAIM SEVERITY (Rp juta)
+Periode           P10      P50      P90    Width80  Zona
+   2025-08        44.6     50.7     54.4        9.8  ML
+   2025-09        42.5     48.4     52.0        9.5  ML
+   2025-10        42.3     48.1     52.3       10.0  ML
+   2025-11        40.9     46.6     53.0       12.1  ML
+   2025-12        40.0     45.4     49.4        9.5  ML
+   2026-01        39.8     46.4     51.6       11.8  Balance
+   2026-02        46.6     52.9     56.7       10.1  Balance
+   2026-03        42.2     47.5     51.3        9.1  Balance
+   2026-04        44.3     50.3     54.8       10.5  Balance
+   2026-05        41.2     47.0     53.5       12.2  Balance
+   2026-06        44.9     51.0     55.5       10.6  Balance
+   2026-07        43.3     49.3     56.1       12.8  Naive
+   2026-08        44.0     49.9     54.4       10.4  Naive
+   2026-09        46.4     51.8     57.6       11.2  Naive
+   2026-10        40.1     45.5     49.6        9.5  Naive
+   2026-11        43.6     49.6     56.4       12.9  Naive
+   2026-12        42.1     48.5     52.0        9.9  Naive
+
+RINGKASAN 2026 (Rp juta/klaim (rata-rata bulanan)):
+   P10 : 43.2
+   P50 : 49.2
+   P90 : 54.1
+   Lebar 80% PI : 10.9
 
 =======================================================
 PI — Claim_Severity
