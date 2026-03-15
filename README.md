@@ -2,7 +2,7 @@
 
 Submission untuk kompetisi **MCF ITB 2026**. Notebook ini menyajikan pipeline lengkap untuk memprediksi frekuensi klaim, severitas klaim, dan total klaim bulanan portofolio AXA Financial Indonesia yang terdiri dari 4.096 pemegang polis, dengan horizon forecast 17 bulan (Agustus 2025 – Desember 2026).
 
----
+
 
 ## Gambaran Masalah
 
@@ -13,7 +13,7 @@ Submission untuk kompetisi **MCF ITB 2026**. Notebook ini menyajikan pipeline le
 | Metrik evaluasi | MAPE (Mean Absolute Percentage Error) |
 | Tantangan utama | Rasio historis vs forecast hampir 1:1, risiko overfitting tinggi |
 
----
+
 
 ## Pendekatan
 
@@ -27,7 +27,7 @@ Digunakan ensemble tiga model komplementer yang digabungkan dengan **inverse MAP
 
 Untuk mencegah error compounding di horizon panjang, diterapkan **progressive weighting** yang secara bertahap meningkatkan bobot Seasonal Naive. Pada 2026 (zona naive), bobot Seasonal Naive berkisar antara 50–80%.
 
----
+
 
 ## Struktur Notebook
 
@@ -50,7 +50,7 @@ Untuk mencegah error compounding di horizon panjang, diterapkan **progressive we
 | 10 | Ekspor model |
 | 11 | Rekomendasi bisnis |
 
----
+
 
 ## Data
 
@@ -82,7 +82,7 @@ Batas winsorisasi:
 | Length_of_Stay | Selisih tanggal masuk dan keluar RS |
 | Claim_Ratio | Nominal klaim disetujui dibagi biaya RS aktual |
 
----
+
 
 ## Hasil
 
@@ -114,7 +114,7 @@ Batas winsorisasi:
 | Q4 2026 (Okt–Des) | Rp 36,55 M | Rp 38,13 M |
 | **Total 2026** | **Rp 143,00 M** | **Rp 149,11 M** |
 
----
+
 
 ## Temuan Utama (EDA)
 
@@ -129,7 +129,7 @@ Batas winsorisasi:
 
 **Tren temporal:** Puncak historis terjadi di Januari 2024 (302 klaim, total Rp 18,95 miliar). Setelahnya, frekuensi stabil di 208–278 klaim/bulan. Pola musiman ini sangat berulang dan terkonfirmasi di forecast 2026.
 
----
+
 
 ## Model yang Diekspor
 
@@ -146,7 +146,7 @@ Semua model tersimpan di folder `models/`:
 | `seasonal_naive.json` | Lookup table Seasonal Naive per bulan dan target |
 | `ensemble_meta.json` | Bobot ensemble dan daftar fitur |
 
----
+
 
 ## Instalasi
 
@@ -156,7 +156,7 @@ pip install prophet lightgbm
 
 Library lain yang digunakan: `pandas`, `numpy`, `matplotlib`, `seaborn`, `scikit-learn`, `scipy`, `statsmodels`.
 
----
+
 
 ## Cara Menjalankan
 
@@ -170,7 +170,7 @@ Jalankan notebook secara berurutan dari Cell 0 hingga Cell 11. Pastikan file `Da
 └── models/           # dibuat otomatis saat Cell 10 dijalankan
 ```
 
----
+
 
 ## Catatan Metodologis
 
