@@ -1,4 +1,4 @@
-# AXA Financial Indonesia — Prediksi Klaim Asuransi
+# AXA Financial Indonesia Prediksi Klaim Asuransi
 
 Submission untuk kompetisi **MCF ITB 2026**. Notebook ini menyajikan pipeline lengkap untuk memprediksi frekuensi klaim, severitas klaim, dan total klaim bulanan portofolio AXA Financial Indonesia yang terdiri dari 4.096 pemegang polis, dengan horizon forecast 17 bulan (Agustus 2025 – Desember 2026).
 
