@@ -1,179 +1,216 @@
-# AXA Financial Indonesia Prediksi Klaim Asuransi
+<div align="center">
+  <img src="logo.png" alt="Logo" width="128" height="128">
+  
+  <h1>AXA Financial Indonesia Insurance Claim Forecasting</h1>
+  <p><strong>Hierarchical Ensemble Forecasting & Actuarial Risk Analysis for MCF ITB 2026</strong></p>
+  
+  <p align="center">
+    <img src="https://img.shields.io/badge/Competition-MCF_ITB_2026-blue?style=flat-square" alt="Competition">
+    <img src="https://img.shields.io/badge/Language-Python_3-3776AB?style=flat-square&logo=python&logoColor=white" alt="Language">
+    <img src="https://img.shields.io/badge/Status-Completed-success?style=flat-square" alt="Status">
+    <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License">
+  </p>
+  
+  <p align="center">
+    An end-to-end time series and machine learning pipeline to forecast monthly insurance claim frequency, claim severity, and total claims for a portfolio of 4,096 policyholders across a 17-month horizon (August 2025 - December 2026).
+  </p>
+</div>
 
-Submission untuk kompetisi **MCF ITB 2026**. Notebook ini menyajikan pipeline lengkap untuk memprediksi frekuensi klaim, severitas klaim, dan total klaim bulanan portofolio AXA Financial Indonesia yang terdiri dari 4.096 pemegang polis, dengan horizon forecast 17 bulan (Agustus 2025 – Desember 2026).
+## Tech Stack
 
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![NumPy](https://img.shields.io/badge/numpy-%23013243.svg?style=for-the-badge&logo=numpy&logoColor=white)
+![Pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=for-the-badge&logo=pandas&logoColor=white)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=for-the-badge&logo=scikit-learn&logoColor=white)
+![Matplotlib](https://img.shields.io/badge/Matplotlib-%23ffffff.svg?style=for-the-badge&logo=Matplotlib&logoColor=black)
+![Git](https://img.shields.io/badge/git-%23F05033.svg?style=for-the-badge&logo=git&logoColor=white)
 
-
-## Gambaran Masalah
+## Problem Overview
 
 | Parameter | Detail |
 |---|---|
-| Data historis | 19 bulan (Januari 2024 – Juli 2025), 4.627 klaim PAID |
-| Horizon forecast | 17 bulan (Agustus 2025 – Desember 2026) |
-| Metrik evaluasi | MAPE (Mean Absolute Percentage Error) |
-| Tantangan utama | Rasio historis vs forecast hampir 1:1, risiko overfitting tinggi |
+| Historical Data | 19 months (January 2024 - July 2025), 4,627 PAID claims |
+| Forecast Horizon | 17 months (August 2025 - December 2026) |
+| Target Variables | `Claim_Frequency`, `Claim_Severity`, `Total_Claim` |
+| Evaluation Metric | MAPE (Mean Absolute Percentage Error) |
+| Core Challenge | Historical-to-forecast ratio is nearly 1:1, posing a high risk of long-range variance and compounding errors |
 
+## Methodology and Architecture
 
+The forecasting system combines three complementary models using inverse MAPE weighting derived from walk-forward cross-validation:
 
-## Pendekatan
+1. **Prophet**: Captures macroeconomic trends, annual progression, and quarterly seasonal oscillations.
+2. **LightGBM**: Models non-linear interactions, lag structures (Lags 1-3), rolling statistics (Rolling 3, Rolling 6, Rolling Std), and seasonal trigonometric signals.
+3. **Seasonal Naive**: Acts as an empirical statistical baseline anchored to month-of-year historical patterns.
 
-Digunakan ensemble tiga model komplementer yang digabungkan dengan **inverse MAPE weighting** dari walk-forward cross-validation.
+### Inverse MAPE Blending
 
-| Model | Peran |
-|---|---|
-| Prophet | Menangkap tren jangka panjang dan seasonality kuartalan |
-| LightGBM | Menangkap pola non-linear dan interaksi fitur |
-| Seasonal Naive | Baseline statistik berbasis rata-rata historis per bulan |
+Base ensemble weights are computed from out-of-fold validation errors:
 
-Untuk mencegah error compounding di horizon panjang, diterapkan **progressive weighting** yang secara bertahap meningkatkan bobot Seasonal Naive. Pada 2026 (zona naive), bobot Seasonal Naive berkisar antara 50–80%.
+$$
+w_m = rac{rac{1}{\text{MAPE}_m}}{\sum_{k=1}^{K} rac{1}{\text{MAPE}_k}}
+$$
 
+### Progressive Weighting for Long Horizon
 
+To prevent ML divergence and error compounding across the 17-month horizon, a progressive weighting mechanism dynamically shifts weight toward the Seasonal Naive baseline over time. By 2026 (the naive zone), Seasonal Naive accounts for 50% - 80% of the blended prediction.
 
-## Struktur Notebook
+## Notebook Pipeline Structure
 
-| Cell | Deskripsi |
-|---|---|
-| 0 | Instalasi library dan import |
-| 1 | Load data, preprocessing, dan winsorisasi |
-| 2 | Exploratory Data Analysis (EDA) |
-| 3 | Agregasi bulanan, proyeksi exposure, feature engineering |
-| 4 | Walk-forward cross-validation dan perhitungan bobot ensemble |
-| 4A | Sensitivity analysis: Prophet hyperparameter & Naive blending |
-| 5 | Training model final pada seluruh data |
-| 6 | Forecast 17 bulan dengan progressive weighting |
-| 6A | Block bootstrap prediction intervals (Total Claim, Frequency, Severity) |
-| 6B | Backtesting empirical coverage prediction intervals |
-| 7 | Pembuatan file submission Kaggle |
-| 8 | Analisis dampak feature engineering |
-| 9A | Analisis faktor berpengaruh level individual klaim |
-| 9B | Analisis feature importance level portofolio |
-| 10 | Ekspor model |
-| 11 | Rekomendasi bisnis |
+The entire research and modeling workflow is implemented in `119_DSC_Cungpret_Notebook.ipynb`:
 
-
-
-## Data
-
-### Sumber
-
-- **Data_Polis.csv** — 4.096 pemegang polis aktif dengan atribut demografis (gender, tanggal lahir, tanggal efektif polis) dan informasi produk (Plan Code: M-001, M-002, M-003).
-- **Data_Klaim.csv** — 5.781 transaksi klaim dengan diagnosis ICD, tipe layanan (Inpatient/Outpatient), metode pembayaran (Cashless/Reimburse), tanggal masuk-keluar RS, dan nominal klaim yang disetujui.
-
-### Preprocessing
-
-1. Parsing dan standarisasi format tanggal dari YYYYMMDD (data polis) dan format campuran (data klaim).
-2. Filter hanya klaim berstatus PAID; tersisa 4.627 records.
-3. Deduplikasi berdasarkan Claim ID.
-4. Winsorisasi 1%–99% untuk membatasi pengaruh outlier ekstrem pada level individual klaim.
-
-**Mengapa winsorisasi, bukan StandardScaler?** Distribusi nominal klaim sangat right-skewed. Winsorisasi dipilih karena mempertahankan skala Rupiah asli yang penting untuk pelaporan aktuaria, sedangkan LightGBM sebagai tree-based model bersifat invariant terhadap monotonic transformation sehingga StandardScaler tidak memberikan manfaat tambahan.
-
-Batas winsorisasi:
-- Lower bound: Rp 187.242
-- Upper bound: Rp 633.686.130
-
-### Feature Engineering
-
-| Fitur | Deskripsi |
-|---|---|
-| Umur | Dihitung per 1 Juli 2025 sebagai tanggal referensi |
-| Lama_Polis | Tahun sejak tanggal efektif polis |
-| Kelompok_Umur | 5 kategori: <18, 18-30, 31-45, 46-60, >60 |
-| Length_of_Stay | Selisih tanggal masuk dan keluar RS |
-| Claim_Ratio | Nominal klaim disetujui dibagi biaya RS aktual |
-
-
-
-## Hasil
-
-### Performa Model
-
-| Metrik | Nilai |
-|---|---|
-| MAPE internal (walk-forward) | 4,79% |
-| MAPE public leaderboard | 5,8% (5 bulan pertama) |
-| 80% Prediction Interval (Total Claim) | Rp 132,34 – 149,11 miliar |
-| Empirical coverage (backtesting 9 window) | 88,9% untuk Total Claim |
-
-### Prediksi Ringkasan 2026
-
-| Metrik | Prediksi |
-|---|---|
-| Total Frekuensi | ~2.827 klaim (+0,8% vs 2025 annualized) |
-| Rata-rata Severitas | ~Rp 49,4 juta per klaim (-3,0% vs 2025 annualized) |
-| Total Klaim (point estimate) | Rp 143,00 miliar |
-| Total Klaim (P50 bootstrap) | Rp 143,49 miliar |
-
-### Cadangan Teknis per Kuartal 2026
-
-| Kuartal | Point Estimate | P90 Konservatif |
+| Cell | Stage | Description |
 |---|---|---|
-| Q1 2026 (Jan–Mar) | Rp 37,13 M | Rp 38,70 M |
-| Q2 2026 (Apr–Jun) | Rp 33,32 M | Rp 34,74 M |
-| Q3 2026 (Jul–Sep) | Rp 36,01 M | Rp 37,54 M |
-| Q4 2026 (Okt–Des) | Rp 36,55 M | Rp 38,13 M |
-| **Total 2026** | **Rp 143,00 M** | **Rp 149,11 M** |
+| Cell 0 | Environment | Library installation and dependencies import |
+| Cell 1 | Data Preprocessing | Ingestion, data cleaning, date standardization, and 1%-99% winsorization |
+| Cell 2 | Exploratory Data Analysis | Distribution analysis, risk factor profiling, and statistical hypothesis tests |
+| Cell 3 | Feature Engineering | Monthly aggregation, exposure projection, lag creation, and cyclical encodings |
+| Cell 4 | Validation Strategy | Walk-forward cross-validation and inverse MAPE ensemble weight optimization |
+| Cell 4A | Sensitivity Analysis | Prophet hyperparameter grid exploration and naive blending robustness checks |
+| Cell 5 | Final Training | Full-dataset model fitting across frequency, severity, and total claim targets |
+| Cell 6 | Multi-Step Forecasting | 17-month recursive and direct forecasting with progressive weighting |
+| Cell 6A | Uncertainty Estimation | Block bootstrap prediction intervals (80% and 90% confidence bands) |
+| Cell 6B | Empirical Backtesting | 9-window historical coverage backtesting for prediction intervals |
+| Cell 7 | Submission Generation | Formatting and exporting competition predictions (`submission.csv`) |
+| Cell 8 | Feature Ablation Study | Quantitative evaluation of feature contributions against baseline models |
+| Cell 9A | Micro-Level Analysis | Claim-level driver identification using Kruskal-Wallis and Spearman correlation |
+| Cell 9B | Macro-Level Analysis | Portfolio-level LightGBM feature importance and SHAP interpretation |
+| Cell 10 | Artifact Export | Serializing trained models and metadata to `models/` |
+| Cell 11 | Strategic Insights | Actuarial risk recommendations and business takeaways |
 
+## Data Preprocessing and Feature Engineering
 
+### Data Sources
 
-## Temuan Utama (EDA)
+- `Data_Polis.csv`: Contains 4,096 active policyholders with demographic information (Gender, Date of Birth, Policy Effective Date) and insurance plans (Plan Code: M-001, M-002, M-003).
+- `Data_Klaim.csv`: Contains 5,781 claim transactions with ICD diagnosis codes, service types (Inpatient vs Outpatient), payment methods (Cashless vs Reimbursement), hospital admission/discharge dates, and approved claim amounts.
 
-**Distribusi klaim** sangat right-skewed; mayoritas klaim di bawah Rp 50 juta dengan puncak distribusi di bawah Rp 20 juta.
+### Data Cleaning and Transformation
 
-**Faktor risiko dominan:**
-- Kelompok umur >60 tahun mendominasi dengan lebih dari 2.200 klaim dan median tertinggi.
-- N18.0 (gagal ginjal stadium akhir) adalah diagnosis dengan volume klaim terbesar (~300 klaim), diikuti C50 (kanker payudara) dan H26 (katarak).
-- Length of Stay adalah prediktor numerik terkuat (Spearman rho = 0,503, p < 0,001).
-- Klaim Inpatient memiliki nilai median 9,94x lebih tinggi dibanding Outpatient.
-- Metode Cashless secara konsisten menghasilkan median klaim lebih tinggi (~Rp 20 juta) dibanding Reimburse (<Rp 10 juta).
+1. Standardized mixed date formats between policy records (`YYYYMMDD`) and claims records.
+2. Filtered for approved claims with status `PAID` (4,627 records retained).
+3. Resolved duplicate entries based on unique `Claim ID`.
+4. Applied 1%-99% two-sided winsorization on claim amounts to protect models against extreme tail outliers while preserving the natural Rupiah currency scale.
 
-**Tren temporal:** Puncak historis terjadi di Januari 2024 (302 klaim, total Rp 18,95 miliar). Setelahnya, frekuensi stabil di 208–278 klaim/bulan. Pola musiman ini sangat berulang dan terkonfirmasi di forecast 2026.
+Winsorization thresholds:
+- Lower Bound: IDR 187,242
+- Upper Bound: IDR 633,686,130
 
+### Engineered Features
 
+| Feature | Type | Formulation / Description |
+|---|---|---|
+| `Age` | Demographic | Calculated relative to reference date (July 1, 2025) |
+| `Policy_Tenure` | Portfolio | Elapsed years since policy effective date |
+| `Age_Group` | Categorical | Five actuarial brackets: <18, 18-30, 31-45, 46-60, >60 |
+| `Length_of_Stay` | Utilization | Days between hospital admission and discharge |
+| `Claim_Ratio` | Financial | Approved claim amount divided by total hospital billed charges |
+| `Trigonometric Cyclical` | Temporal | Sine and cosine encodings for month and quarter cycles |
+| `Lags & Rolling Windows` | Time Series | Lag 1-3, Rolling Mean 3, Rolling Mean 6, and Rolling Standard Deviation |
 
-## Model yang Diekspor
+## Results and Performance
 
-Semua model tersimpan di folder `models/`:
+### Validation Metrics
 
-| File | Deskripsi |
+| Metric | Result |
 |---|---|
-| `lgbm_freq.pkl` | LightGBM untuk prediksi frekuensi |
-| `lgbm_sev.pkl` | LightGBM untuk prediksi severitas |
-| `lgbm_total.pkl` | LightGBM untuk prediksi total klaim |
-| `prophet_freq.pkl` | Prophet untuk prediksi frekuensi |
-| `prophet_sev.pkl` | Prophet untuk prediksi severitas |
-| `prophet_total.pkl` | Prophet untuk prediksi total klaim |
-| `seasonal_naive.json` | Lookup table Seasonal Naive per bulan dan target |
-| `ensemble_meta.json` | Bobot ensemble dan daftar fitur |
+| Internal Walk-Forward Validation MAPE | 4.79% |
+| Public Leaderboard MAPE (First 5 Months) | 5.80% |
+| Total Claim 80% Prediction Interval (2026) | IDR 132.34 - 149.11 Billion |
+| Empirical Coverage (9-Window Backtesting) | 88.9% for Total Claim |
 
+### 2026 Annual Portfolio Forecast
 
+| Target Variable | 2026 Point Forecast | Annual Trend vs 2025 Annualized |
+|---|---|---|
+| Total Claim Frequency | ~2,827 claims | +0.8% |
+| Average Claim Severity | ~IDR 49.40 Million / claim | -3.0% |
+| Total Claim (Point Estimate) | IDR 143.00 Billion | Stable growth trajectory |
+| Total Claim (P50 Bootstrap) | IDR 143.49 Billion | High median consistency |
 
-## Instalasi
+### 2026 Quarterly Technical Reserve Allocations
 
-```bash
-pip install prophet lightgbm
-```
+| Quarter | Point Estimate | Conservative P90 Reserve |
+|---|---|---|
+| Q1 2026 (Jan - Mar) | IDR 37.13 Billion | IDR 38.70 Billion |
+| Q2 2026 (Apr - Jun) | IDR 33.32 Billion | IDR 34.74 Billion |
+| Q3 2026 (Jul - Sep) | IDR 36.01 Billion | IDR 37.54 Billion |
+| Q4 2026 (Oct - Dec) | IDR 36.55 Billion | IDR 38.13 Billion |
+| **Full Year 2026 Total** | **IDR 143.00 Billion** | **IDR 149.11 Billion** |
 
-Library lain yang digunakan: `pandas`, `numpy`, `matplotlib`, `seaborn`, `scikit-learn`, `scipy`, `statsmodels`.
+## Key Findings and Exploratory Insights
 
+- **Severity Distribution**: Heavily right-skewed; over 80% of claims are under IDR 50 Million, with the main concentration below IDR 20 Million.
+- **Age Concentration**: Policyholders aged >60 generate over 2,200 claims with the highest median claim cost across all cohorts.
+- **Diagnosis Patterns**: ICD code `N18.0` (End-stage renal disease) represents the single largest volume of recurring claims (~300 claims), followed by `C50` (Breast malignant neoplasm) and `H26` (Cataract).
+- **Hospitalization Dynamics**: `Length_of_Stay` exhibits the highest numerical correlation with claim amount (Spearman rho = 0.503, p < 0.001). Inpatient claims have a 9.94x higher median cost than Outpatient claims.
+- **Payment Method Effect**: Cashless claims consistently yield higher median payouts (~IDR 20 Million) compared to Reimbursement claims (<IDR 10 Million).
+- **Seasonality**: Historical claim volume peaks annually in January (302 claims, IDR 18.95 Billion in Jan 2024), followed by stable monthly activity between 208 and 278 claims.
 
+## Exported Model Artifacts
 
-## Cara Menjalankan
+All trained models and ensemble metadata are stored in the `models/` directory:
 
-Jalankan notebook secara berurutan dari Cell 0 hingga Cell 11. Pastikan file `Data_Polis.csv` dan `Data_Klaim.csv` berada di direktori yang sama dengan notebook.
+| Artifact File | Model Architecture | Target Description |
+|---|---|---|
+| `lgbm_freq.pkl` | LightGBM Regressor | Monthly Claim Frequency |
+| `lgbm_sev.pkl` | LightGBM Regressor | Monthly Average Claim Severity |
+| `lgbm_total.pkl` | LightGBM Regressor | Monthly Total Claim Amount |
+| `prophet_freq.pkl` | Facebook Prophet | Claim Frequency Trend & Seasonality |
+| `prophet_sev.pkl` | Facebook Prophet | Claim Severity Trend & Seasonality |
+| `prophet_total.pkl` | Facebook Prophet | Total Claim Trend & Seasonality |
+| `seasonal_naive.json` | Statistical Baseline | Empirical monthly lookup values |
+| `ensemble_meta.json` | Configuration | Ensemble weights and feature specifications |
+
+## Repository Structure
 
 ```
 .
-├── notebook.ipynb
-├── Data_Polis.csv
-├── Data_Klaim.csv
-└── models/           # dibuat otomatis saat Cell 10 dijalankan
+├── 119_DSC_Cungpret_Notebook.ipynb    # Main pipeline notebook (Cells 0 - 11)
+├── 119_DSC_Cungpret_Laporan.pdf     # Comprehensive competition technical report
+├── case study.pdf                    # Competition problem statement and guidelines
+├── guidebook.pdf                     # Competition guidebook
+├── Data_Polis.csv                    # Policyholder portfolio dataset
+├── Data_Klaim.csv                    # Historical claims dataset
+├── submission.csv                    # Final generated forecast submission
+├── sample_submission.csv             # Kaggle submission template
+├── requirements.txt                  # Python dependencies
+├── .gitignore                        # Git ignore patterns
+├── LICENSE                           # MIT License
+├── logo.png                          # Repository logo
+└── models/                           # Serialized model binaries and metadata
+    ├── ensemble_meta.json
+    ├── seasonal_naive.json
+    ├── lgbm_freq.pkl
+    ├── lgbm_sev.pkl
+    ├── lgbm_total.pkl
+    ├── prophet_freq.pkl
+    ├── prophet_sev.pkl
+    └── prophet_total.pkl
 ```
 
+## Getting Started
 
+### Prerequisites
 
-## Catatan Metodologis
+Ensure Python 3.9+ is installed in your environment.
 
-- Prediction interval Total Claim tervalidasi secara empiris dengan coverage 88,9% pada 9 window backtesting, melampaui target nominal 80%.
-- Prediction interval Frequency dan Severity bersifat indikatif (empirical coverage 66,7%, undercoverage terdokumentasi).
-- Prediksi 2026 berada di zona naive dengan bobot Seasonal Naive 50–80%, mencerminkan keterbatasan ekstrapolasi model ML pada horizon panjang dengan data historis 19 bulan.
+### Installation
+
+Clone the repository and install the required dependencies:
+
+```bash
+git clone https://github.com/ababilkhoerulimam/mcfitb26.git
+cd mcfitb26
+pip install -r requirements.txt
+```
+
+### Execution
+
+Open and run `119_DSC_Cungpret_Notebook.ipynb` sequentially from Cell 0 through Cell 11. Ensure that `Data_Polis.csv` and `Data_Klaim.csv` are in the project root directory.
+
+## Methodological Notes
+
+- The Total Claim prediction interval achieves an empirical coverage of 88.9% across 9 backtesting windows, surpassing the 80% nominal target.
+- Claim Frequency and Claim Severity prediction intervals provide indicative bands with an empirical coverage of 66.7%.
+- The 2026 forecast applies a progressive blend giving 50% - 80% weight to the Seasonal Naive baseline to safeguard against model extrapolation drift given the 19-month historical sample size.
