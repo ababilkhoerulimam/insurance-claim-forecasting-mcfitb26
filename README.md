@@ -178,9 +178,10 @@ All trained models and ensemble metadata are stored in the `models/` directory:
 ├── .gitignore                        # Git ignore patterns
 ├── LICENSE                           # MIT License
 ├── logo.png                          # Repository logo
-├── certificate_ababil_khoerul_imam.jpg # Competition certificate
-├── certificate_ferliyana_ronnan.jpg  # Competition certificate
-├── certificate_vierico_ventora.jpg   # Competition certificate
+├── certificates/                     # Competition finalist certificates
+│   ├── certificate_ababil_khoerul_imam.jpg
+│   ├── certificate_ferliyana_ronnan.jpg
+│   └── certificate_vierico_ventora.jpg
 └── models/                           # Serialized model binaries and metadata
     ├── ensemble_meta.json
     ├── seasonal_naive.json
@@ -222,9 +223,9 @@ Open and run `119_DSC_Cungpret_Notebook.ipynb` sequentially from Cell 0 through 
 
 MCF ITB 2026 Finalists:
 
-- Ababil Khoerul Imam ([Certificate](certificate_ababil_khoerul_imam.jpg))
-- Ferliyana Ronnan ([Certificate](certificate_ferliyana_ronnan.jpg))
-- Vierico Ventora ([Certificate](certificate_vierico_ventora.jpg))
+- Ababil Khoerul Imam ([Certificate](certificates/certificate_ababil_khoerul_imam.jpg))
+- Ferliyana Ronnan ([Certificate](certificates/certificate_ferliyana_ronnan.jpg))
+- Vierico Ventora ([Certificate](certificates/certificate_vierico_ventora.jpg))
 
 ## License
 
