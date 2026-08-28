@@ -203,8 +203,8 @@ Ensure Python 3.9+ is installed in your environment.
 Clone the repository and install the required dependencies:
 
 ```bash
-git clone https://github.com/ababilkhoerulimam/mcfitb26.git
-cd mcfitb26
+git clone https://github.com/ababilkhoerulimam/insurance-claim-forecasting-mcfitb26.git
+cd insurance-claim-forecasting-mcfitb26
 pip install -r requirements.txt
 ```
 
