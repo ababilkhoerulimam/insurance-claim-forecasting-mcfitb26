@@ -217,3 +217,16 @@ Open and run `119_DSC_Cungpret_Notebook.ipynb` sequentially from Cell 0 through 
 - The Total Claim prediction interval achieves an empirical coverage of 88.9% across 9 backtesting windows, surpassing the 80% nominal target.
 - Claim Frequency and Claim Severity prediction intervals provide indicative bands with an empirical coverage of 66.7%.
 - The 2026 forecast applies a progressive blend giving 50% - 80% weight to the Seasonal Naive baseline to safeguard against model extrapolation drift given the 19-month historical sample size.
+
+## Team Cungpret
+
+MCF ITB 2026 Finalists:
+
+- Ababil Khoerul Imam ([Certificate](certificate_ababil_khoerul_imam.jpg))
+- Ferliyana Ronnan ([Certificate](certificate_ferliyana_ronnan.jpg))
+- Vierico Ventora ([Certificate](certificate_vierico_ventora.jpg))
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
