@@ -167,9 +167,6 @@ All trained models and ensemble metadata are stored in the `models/` directory:
 ```
 .
 ├── 119_DSC_Cungpret_Notebook.ipynb    # Main pipeline notebook (Cells 0 - 11)
-├── 119_DSC_Cungpret_Laporan.pdf     # Comprehensive competition technical report
-├── case study.pdf                    # Competition problem statement and guidelines
-├── guidebook.pdf                     # Competition guidebook
 ├── Data_Polis.csv                    # Policyholder portfolio dataset
 ├── Data_Klaim.csv                    # Historical claims dataset
 ├── submission.csv                    # Final generated forecast submission
@@ -178,6 +175,10 @@ All trained models and ensemble metadata are stored in the `models/` directory:
 ├── .gitignore                        # Git ignore patterns
 ├── LICENSE                           # MIT License
 ├── logo.png                          # Repository logo
+├── case_study/                       # Competition problem, guidebook, & report
+│   ├── 119_DSC_Cungpret_Laporan.pdf
+│   ├── case_study.pdf
+│   └── guidebook.pdf
 ├── certificates/                     # Competition finalist certificates
 │   ├── certificate_ababil_khoerul_imam.jpg
 │   ├── certificate_ferliyana_ronnan.jpg
