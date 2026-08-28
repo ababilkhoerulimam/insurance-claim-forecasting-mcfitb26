@@ -178,6 +178,9 @@ All trained models and ensemble metadata are stored in the `models/` directory:
 ├── .gitignore                        # Git ignore patterns
 ├── LICENSE                           # MIT License
 ├── logo.png                          # Repository logo
+├── certificate_ababil_khoerul_imam.jpg # Competition certificate
+├── certificate_ferliyana_ronnan.jpg  # Competition certificate
+├── certificate_vierico_ventora.jpg   # Competition certificate
 └── models/                           # Serialized model binaries and metadata
     ├── ensemble_meta.json
     ├── seasonal_naive.json
